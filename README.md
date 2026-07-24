@@ -6,8 +6,8 @@ A dependency-free [Model Context Protocol (MCP)](https://modelcontextprotocol.io
 
 [![CI](https://github.com/CantC0unt/crosstalk/actions/workflows/ci.yml/badge.svg)](https://github.com/CantC0unt/crosstalk/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/CantC0unt/crosstalk/actions/workflows/codeql.yml/badge.svg)](https://github.com/CantC0unt/crosstalk/actions/workflows/codeql.yml)
-[![PyPI](https://img.shields.io/pypi/v/crosstalk-mcp-server)](https://pypi.org/project/crosstalk-mcp-server/)
-[![Python](https://img.shields.io/pypi/pyversions/crosstalk-mcp-server)](https://pypi.org/project/crosstalk-mcp-server/)
+[![PyPI](https://img.shields.io/pypi/v/crosstalk-mcp-server.svg)](https://pypi.org/project/crosstalk-mcp-server/)
+[![Python](https://img.shields.io/pypi/pyversions/crosstalk-mcp-server.svg)](https://pypi.org/project/crosstalk-mcp-server/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 </div>
