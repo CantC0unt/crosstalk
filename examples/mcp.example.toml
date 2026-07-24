@@ -1,0 +1,6 @@
+[mcp_servers.crosstalk]
+command = "crosstalk-mcp"
+
+[mcp_servers.crosstalk.env]
+CROSSTALK_GROUPS_DIR = "/absolute/path/to/shared/crosstalk-groups"
+CROSSTALK_POLL_INTERVAL_SECONDS = "0.5"

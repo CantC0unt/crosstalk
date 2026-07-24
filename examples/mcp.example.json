@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "crosstalk": {
+      "command": "crosstalk-mcp",
+      "env": {
+        "CROSSTALK_GROUPS_DIR": "/absolute/path/to/shared/crosstalk-groups",
+        "CROSSTALK_POLL_INTERVAL_SECONDS": "0.5"
+      }
+    }
+  }
+}
