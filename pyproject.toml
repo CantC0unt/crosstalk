@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "crosstalk-mcp-server"
 dynamic = ["version"]
 description = "A dependency-free MCP server for AI-context group messaging"
-readme = {file = "README", content-type = "text/markdown"}
+readme = "README.md"
 license = {file = "LICENSE"}
 authors = [
   {name = "Vaibhav Verma"},

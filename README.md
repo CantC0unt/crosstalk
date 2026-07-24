@@ -218,4 +218,4 @@ Distributed under the [MIT License](LICENSE).
 
 ## Contributing
 
-See [CONTRIBUTING](CONTRIBUTING) for local setup, testing, pull-request, and release conventions.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for local setup, testing, pull-request, and release conventions.
