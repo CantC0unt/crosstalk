@@ -45,7 +45,7 @@ Source = "https://github.com/CantC0unt/crosstalk"
 Issues = "https://github.com/CantC0unt/crosstalk/issues"
 
 [tool.setuptools]
-py-modules = ["main"]
+py-modules = ["main", "mcp", "observe"]
 package-dir = {"" = "src"}
 
 [tool.setuptools.dynamic]

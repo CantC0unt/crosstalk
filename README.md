@@ -117,6 +117,54 @@ All participants must use the same accessible `CROSSTALK_GROUPS_DIR`. The defaul
 
 The server creates its default directory automatically. Each database records its schema version for inspection; automatic migration of old layouts is intentionally not supported.
 
+## Observer dashboard
+
+Start the local, read-only dashboard separately from the MCP server:
+
+```sh
+crosstalk-mcp observe [--silent] [--port PORT] [--poll-interval SECONDS] [--groups-dir PATH]
+```
+
+The dashboard binds only to `127.0.0.1`; it is not a network service or an access-control boundary. Anyone who can access the same local account, loopback endpoint, or groups directory is already within this trusted-local boundary. Do not expose the observer through a proxy or bind it to another interface.
+
+By default it opens the displayed URL in your browser. Use `--silent` to suppress only that browser launch; the URL still prints. In headless environments or if the browser cannot be opened, leave the process running and visit the printed URL from the same machine.
+
+Without `--port`, Crosstalk first tries `127.0.0.1:8787`; if it is busy, it falls back to an OS-selected loopback port and prints the actual URL. `--port PORT` requests that exact port and fails if it is unavailable. `--poll-interval` controls observer refresh timing only and defaults to `0.5` seconds.
+
+The observer resolves the groups directory in this order:
+
+1. `--groups-dir PATH`
+2. `CROSSTALK_GROUPS_DIR`
+3. `~/.cache/crosstalk`
+
+Unlike the MCP server, the observer does not create a missing directory. It starts empty and begins showing groups if the directory appears later.
+
+### Audit history and privacy
+
+Auditing is opt-in. Set one of these variables in the environment that starts `crosstalk-mcp`:
+
+```sh
+# Keep audit history without an automatic retention cleanup.
+CROSSTALK_OBSERVABILITY_RETENTION_DAYS=inf
+
+# Keep audit history for a bounded number of days.
+CROSSTALK_OBSERVABILITY_RETENTION_DAYS=30
+```
+
+When unset, auditing is disabled and no observability database is created. When enabled, audit history is stored at `<groups-directory>/observability.sqlite3`, separate from the `grp_*.sqlite3` chat databases. `inf` is the unlimited-retention option; a positive integer enables a once-per-day, bounded cleanup of expired rows. The MCP writer records its effective retention setting in audit metadata, so the Storage view reports the writer’s setting even when the dashboard was started from a different environment. Invalid values fail MCP startup rather than changing retention silently.
+
+Analytics begin when auditing is enabled; earlier MCP calls cannot be reconstructed. The observer can show chats while auditing is disabled, but Tool Analytics and audit-storage information remain unavailable until new audit rows exist.
+
+Audit rows contain operational facts only: time, tool, outcome, duration, applicable group/context identity, and a small allowlisted result summary. They never store message bodies, search queries, metadata values, arbitrary inputs, recipient IDs, raw errors, or stack traces. The summary is capped at 2 KiB; it may include counts, a created-group ID, changed metadata field names, a completion flag, or sent-message ID/priority/routing/wakeup-target count.
+
+Retention cleanup makes deleted pages reusable but does not compact the file. The Storage view’s **Reclaim free space** action performs bounded incremental vacuum work on `observability.sqlite3` only; it does not delete retained audit history or touch any group database. **Delete audit history** is a separate, explicitly confirmed permanent action: it removes audit rows only, leaves group data and audit metadata intact, and does not reclaim free pages automatically.
+
+### Browser assets and audit schema
+
+The dashboard loads pinned HTMX and Alpine.js URLs from their CDNs with Subresource Integrity hashes. They are not bundled with Crosstalk, and the dashboard uses no service worker. Normal browser caching applies; an uncached offline browser may not load those libraries. The ordinary first asset request reveals normal browser/network metadata to the selected CDN, but no chats, audit rows, or analytics data are sent there.
+
+`observability.sqlite3` is a public local read contract for analytics tooling. The v1 schema is versioned with SQLite `user_version`; future changes are additive where possible and never automatically alter group databases. Older observers should ignore unknown optional fields and show an unavailable metric when a required field is absent, rather than attempting a destructive migration.
+
 ## How it works
 
 Create a group, then have every participating context join before it sends or retrieves messages:
@@ -203,7 +251,7 @@ Crosstalk is not an access-control system or a multi-tenant service. Group data 
 Run the regression suite:
 
 ```sh
-python3 -m unittest tests/test_main.py
+python3 -m unittest tests/test_main.py tests/test_mcp.py tests/test_observe.py
 ```
 
 ## Releases

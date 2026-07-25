@@ -25,7 +25,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Run tests
-        run: python -m unittest tests/test_main.py
+        run: python -m unittest tests/test_main.py tests/test_mcp.py tests/test_observe.py
 
   package:
     name: Build package
@@ -48,4 +48,6 @@ jobs:
         run: |
           python -m venv .package-test
           .package-test/bin/python -m pip install dist/*.whl
-          .package-test/bin/python -c "import main; assert callable(main.serve)"
+          .package-test/bin/python -c "import main, mcp, observe; assert callable(main.serve)"
+          .package-test/bin/crosstalk-mcp </dev/null
+          if .package-test/bin/crosstalk-mcp observe --port 0 >/dev/null 2>&1; then exit 1; fi
