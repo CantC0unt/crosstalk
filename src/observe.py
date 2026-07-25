@@ -517,11 +517,36 @@ def _message_html(message: dict) -> str:
     ).format(
         id=message["id"],
         sender=html.escape(str(message.get("sender_name") or message.get("sender_context_id") or "Unknown")),
-        created=html.escape(str(message.get("created_at") or "")),
+        created=html.escape(format_timestamp(message.get("created_at"), "")),
         content=html.escape(str(message.get("content") or "")),
         priority=html.escape(str(message.get("priority") or "normal")),
         routing=html.escape(str(message.get("routing_reason") or "normal")),
     )
+
+
+def format_timestamp(value: object, empty: str = "—", local_timezone: Optional[timezone] = None) -> str:
+    """Render an ISO timestamp in the observer machine's local time zone."""
+    if not value:
+        return empty
+    try:
+        timestamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return str(value)
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    local = timestamp.astimezone(local_timezone) if local_timezone is not None else timestamp.astimezone()
+    return local.strftime("%Y-%m-%d %H:%M:%S %Z (%z)")
+
+
+def group_display_name(groups_directory: Optional[Path], group_id: Optional[str]) -> str:
+    """Return a human-readable group name while preserving the ID for routing."""
+    if groups_directory is None or not _valid_group_id(group_id):
+        return str(group_id or "—")
+    try:
+        metadata = read_group_snapshot(groups_directory, group_id)["metadata"] or {}
+    except (OSError, sqlite3.Error, ValueError):
+        return group_id
+    return str(metadata.get("name") or group_id)
 
 
 def render_message_page(groups_directory: Optional[Path], group_id: Optional[str], older_than_message_id: Optional[int] = None) -> str:
@@ -578,9 +603,9 @@ def render_chat_panel(groups_directory: Optional[Path], group_id: Optional[str])
             context=html.escape(str(wakeup.get("context_id") or "—")),
             priority=html.escape(str(wakeup.get("priority") or "normal")),
             relevance=html.escape(str(wakeup.get("relevance") or "")),
-            created=html.escape(str(wakeup.get("created_at") or "—")),
-            acknowledged=html.escape(str(wakeup.get("acknowledged_at") or "pending")),
-            notified=html.escape(str(wakeup.get("last_notified_at") or "never")),
+            created=html.escape(format_timestamp(wakeup.get("created_at"))),
+            acknowledged=html.escape(format_timestamp(wakeup.get("acknowledged_at"), "pending")),
+            notified=html.escape(format_timestamp(wakeup.get("last_notified_at"), "never")),
         ) for wakeup in snapshot["wakeups"]
     ) or "<li>No wakeup events.</li>"
     return (
@@ -620,7 +645,7 @@ def overview_data(groups_directory: Optional[Path]) -> dict:
                 wakeup_response_seconds.append(max(0, response))
             contexts.update(member["context_id"] for member in snapshot["members"])
             if snapshot["latest_message_id"] is not None:
-                activity.append({"group_id": group_id, "created_at": snapshot["latest_activity_at"], "message_id": snapshot["latest_message_id"]})
+                activity.append({"group_id": group_id, "group_name": str((snapshot["metadata"] or {}).get("name") or group_id), "created_at": snapshot["latest_activity_at"], "message_id": snapshot["latest_message_id"]})
             connection = open_read_only_database(_group_database_path(groups_directory, group_id))
             try:
                 for priority, count in connection.execute("SELECT COALESCE(priority, 'normal'), COUNT(*) FROM messages GROUP BY priority"):
@@ -661,8 +686,8 @@ def render_overview(groups_directory: Optional[Path]) -> str:
     metrics = "".join('<article class="metric"><strong>{}</strong><span>{}</span></article>'.format(html.escape(label), totals[key]) for label, key in metric_labels)
     def breakdown(values: dict) -> str:
         return "".join('<li>{}: <strong>{}</strong></li>'.format(html.escape(str(key)), value) for key, value in sorted(values.items())) or "<li>None yet</li>"
-    activity = "".join('<li><strong>{}</strong> · message #{} <small>{}</small></li>'.format(html.escape(item["group_id"]), item["message_id"], html.escape(str(item["created_at"] or ""))) for item in data["activity"]) or "<li>No recent activity.</li>"
-    audit_notice = '<p class="notice error">Audit analytics are disabled. Set <code>CROSSTALK_OBSERVABILITY_RETENTION_DAYS=inf</code> (or a positive number of days) before starting Crosstalk.</p>' if data["audit"] is None else '<p class="notice">Audit active since {}.</p>'.format(html.escape(str(data["audit"].get("audit_enabled_at") or "")))
+    activity = "".join('<li><strong>{}</strong> · message #{} <small>{}</small></li>'.format(html.escape(item["group_name"]), item["message_id"], html.escape(format_timestamp(item["created_at"], ""))) for item in data["activity"]) or "<li>No recent activity.</li>"
+    audit_notice = '<p class="notice error">Audit analytics are disabled. Set <code>CROSSTALK_OBSERVABILITY_RETENTION_DAYS=inf</code> (or a positive number of days) before starting Crosstalk.</p>' if data["audit"] is None else '<p class="notice">Audit active since {}.</p>'.format(html.escape(format_timestamp(data["audit"].get("audit_enabled_at"), "")))
     responsiveness = "No acknowledged wakeups yet." if not totals["acknowledged_wakeups"] else "{} acknowledged wakeup{} included in the average.".format(totals["acknowledged_wakeups"], "" if totals["acknowledged_wakeups"] == 1 else "s")
     return '<section class="overview" data-overview="true"><header><h2>Overview</h2>{}</header><div class="metrics">{}</div><div class="overview-columns"><section><h3>Recent activity</h3><ul>{}</ul></section><section><h3>Message priority</h3><ul>{}</ul><h3>Routing</h3><ul>{}</ul><h3>Wakeup responsiveness</h3><p class="notice">{}</p></section></div></section>'.format(audit_notice, metrics, activity, breakdown(data["priorities"]), breakdown(data["routing"]), responsiveness)
 
@@ -743,8 +768,9 @@ def render_tool_analytics(groups_directory: Optional[Path], filters: Optional[di
         return '<section class="analytics" data-analytics="true">{}<p class="notice error">Audit data is unavailable. Enable auditing to begin collecting tool analytics.</p></section>'.format(form)
     p50, p95 = _percentile(data["durations"], .50), _percentile(data["durations"], .95)
     summary = '<div class="metrics"><article class="metric"><strong>Calls</strong><span>{}</span></article><article class="metric"><strong>p50 latency</strong><span>{} ms</span></article><article class="metric"><strong>p95 latency</strong><span>{} ms</span></article></div>'.format(len(data["rows"]), p50 if p50 is not None else "—", p95 if p95 is not None else "—")
-    rows = "".join('<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{} ms</td></tr>'.format(html.escape(str(row["occurred_at"])), html.escape(row["tool_name"]), html.escape(str(row["name"] or "—")), html.escape(row["outcome"]), html.escape((str(row["group_id"]) + " (deleted)") if row["group_deleted"] else str(row["group_id"] or "—")), row["duration_ms"]) for row in data["rows"][:100]) or "<tr><td colspan=\"6\">No calls match this range.</td></tr>"
-    return '<section class="analytics" data-analytics="true">{}{}<h3>Calls by tool</h3>{}<h3>Calls over time</h3>{}<table><thead><tr><th>When</th><th>Tool</th><th>Caller</th><th>Outcome</th><th>Group</th><th>Duration</th></tr></thead><tbody>{}</tbody></table></section>'.format(form, summary, _analytics_chart(data["by_tool"], "Calls by tool"), _analytics_chart(data["by_time"], "Calls over time"), rows)
+    rows = "".join('<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{} ms</td></tr>'.format(html.escape(format_timestamp(row["occurred_at"])), html.escape(row["tool_name"]), html.escape(str(row["name"] or "—")), html.escape(row["outcome"]), html.escape((str(row["group_id"]) + " (deleted)") if row["group_deleted"] else group_display_name(groups_directory, row["group_id"])), row["duration_ms"]) for row in data["rows"][:100]) or "<tr><td colspan=\"6\">No calls match this range.</td></tr>"
+    displayed_by_time = {format_timestamp(bucket, ""): count for bucket, count in data["by_time"].items()}
+    return '<section class="analytics" data-analytics="true">{}{}<h3>Calls by tool</h3>{}<h3>Calls over time</h3>{}<table><thead><tr><th>When</th><th>Tool</th><th>Caller</th><th>Outcome</th><th>Group</th><th>Duration</th></tr></thead><tbody>{}</tbody></table></section>'.format(form, summary, _analytics_chart(data["by_tool"], "Calls by tool"), _analytics_chart(displayed_by_time, "Calls over time"), rows)
 
 
 def audit_storage_status(groups_directory: Optional[Path], environment: Optional[dict] = None) -> dict:
@@ -828,7 +854,7 @@ def render_storage(groups_directory: Optional[Path], csrf_token: Optional[str] =
         message = status.get("error") or "No audit database exists yet. Enable auditing and make a tool call to create it."
         return '<section class="storage" data-storage="true"><h2>Storage</h2><p class="notice error">{}</p></section>'.format(html.escape(message))
     metadata = status["metadata"] or {}
-    values = (("Audit file", _bytes(status["size_bytes"])), ("Audit rows", str(status["row_count"])), ("Reclaimable", _bytes(status["reclaimable_bytes"])), ("Retention", str(status["retention"])), ("Activated", str(metadata.get("audit_enabled_at") or "—")), ("Last cleanup", str(metadata.get("last_retention_cleanup_at") or "Never")))
+    values = (("Audit file", _bytes(status["size_bytes"])), ("Audit rows", str(status["row_count"])), ("Reclaimable", _bytes(status["reclaimable_bytes"])), ("Retention", str(status["retention"])), ("Activated", format_timestamp(metadata.get("audit_enabled_at"))), ("Last cleanup", format_timestamp(metadata.get("last_retention_cleanup_at"), "Never")))
     details = "".join('<dt>{}</dt><dd>{}</dd>'.format(html.escape(label), html.escape(value)) for label, value in values)
     control = '<p class="notice">Maintenance controls are available after the next update.</p>'
     if csrf_token is not None:
@@ -841,15 +867,15 @@ def render_dashboard(groups_directory: Optional[Path], csrf_token: Optional[str]
     groups = discover_groups(groups_directory) if groups_directory is not None else []
     selected = groups[0] if groups else None
     picker = "".join(
-        '<button hx-get="/fragments/chat?group_id={id}" hx-target="#chat-panel" hx-swap="innerHTML" data-group-id="{id}">{id}</button>'.format(id=html.escape(group_id))
+        '<button hx-get="/fragments/chat?group_id={id}" hx-target="#chat-panel" hx-swap="innerHTML" data-group-id="{id}" title="{id}">{name}</button>'.format(id=html.escape(group_id), name=html.escape(group_display_name(groups_directory, group_id)))
         for group_id in groups
     ) or '<p class="notice">No groups found. This page will update when a group database appears.</p>'
     return """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Crosstalk observer</title>
 <link rel="stylesheet" href="/static/observer.css">
-<script src="https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js" integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+X" crossorigin="anonymous"></script>
-<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.8/dist/cdn.min.js" integrity="sha384-9kJyAubVxnP0hcA+AMMs21U445qsnqhnUF8EBlEpP3a42Kh/JwWjlv2ZcvGfphb" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js" integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+" crossorigin="anonymous"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.8/dist/cdn.min.js" integrity="sha384-X9kJyAubVxnP0hcA+AMMs21U445qsnqhnUF8EBlEpP3a42Kh/JwWjlv2ZcvGfphb" crossorigin="anonymous"></script>
 <style>body{margin:0;background:#10151f;color:#e7edf7;font:16px system-ui,sans-serif}main{max-width:1200px;margin:auto;padding:24px}.layout{display:grid;grid-template-columns:260px 1fr;gap:24px}button{display:block;width:100%;margin:6px 0;padding:9px;border:0;border-radius:6px;background:#26364d;color:inherit;text-align:left}.message{border-left:3px solid #4ba3ff;padding:10px 14px;margin:10px 0;background:#172130;border-radius:5px}.message header,.message footer{display:flex;justify-content:space-between;color:#aebdce;font-size:.84em}.message p{white-space:pre-wrap}.notice{color:#aebdce}.error{color:#ffaba0}.chat{position:relative}.chat aside{float:right;width:180px;background:#172130;padding:12px}.chat aside ul,.overview ul{padding:0;list-style:none}.chat aside small,.overview small{display:block;color:#aebdce}.metrics{display:grid;grid-template-columns:repeat(5,1fr);gap:10px}.metric{padding:14px;background:#172130;border-radius:6px}.metric strong,.metric span{display:block}.metric span{font-size:1.5em}.overview-columns{display:grid;grid-template-columns:1fr 1fr;gap:24px}.filters{display:grid;grid-template-columns:repeat(3,1fr);gap:9px}.filters input{display:block;width:95%;background:#172130;color:inherit;border:1px solid #52647d;padding:6px}.chart{max-width:100%;background:#172130}.chart .bar{fill:#4ba3ff}.chart text{fill:#e7edf7;font-size:8px}.chart line{stroke:#aebdce}.analytics table{width:100%;border-collapse:collapse}.analytics td,.analytics th{padding:6px;text-align:left;border-bottom:1px solid #26364d}.storage-details{display:grid;grid-template-columns:160px 1fr;gap:10px}.storage-details dt{color:#aebdce}.storage-details dd{margin:0}@media(max-width:700px){.layout,.overview-columns,.filters{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(2,1fr)}.chat aside{float:none;width:auto}}</style></head>
 <body><main x-data><header><h1>Crosstalk observer</h1><p>Local, read-only chat monitoring <span id="activity-indicator"></span></p></header><div class="layout"><nav aria-label="Groups"><button hx-get="/fragments/overview" hx-target="#chat-panel" hx-swap="innerHTML">Overview</button><button hx-get="/fragments/analytics" hx-target="#chat-panel" hx-swap="innerHTML">Tool analytics</button><button hx-get="/fragments/storage" hx-target="#chat-panel" hx-swap="innerHTML">Storage</button><h2>Chats</h2>__PICKER__</nav><div id="chat-panel">__PANEL__</div></div></main>
 <script>(function(){function prune(list,fromStart){while(list&&list.querySelectorAll('.message').length>200){var messages=list.querySelectorAll('.message');messages[fromStart?0:messages.length-1].remove()}}function refreshOverview(){var panel=document.getElementById('chat-panel');if(panel.querySelector('[data-overview]'))fetch('/fragments/overview').then(function(r){return r.text()}).then(function(v){panel.innerHTML=v})}function refreshAnalytics(){var panel=document.getElementById('chat-panel');if(panel.querySelector('[data-analytics]'))fetch('/fragments/analytics').then(function(r){return r.text()}).then(function(v){panel.innerHTML=v})}function refreshOpenChat(group){var panel=document.getElementById('chat-panel'),chat=panel.querySelector('[data-group-id]');if(chat&&chat.dataset.groupId===group)fetch('/fragments/chat?group_id='+encodeURIComponent(group)).then(function(r){return r.text()}).then(function(v){panel.innerHTML=v})}document.body.addEventListener('htmx:afterSettle',function(){prune(document.getElementById('message-list'),false)});var source=new EventSource('/events');source.addEventListener('snapshot',function(e){var d=JSON.parse(e.data),chat=document.querySelector('[data-group-id]');if(chat)refreshOpenChat(chat.dataset.groupId);refreshOverview();refreshAnalytics()});source.addEventListener('message.created',function(e){var d=JSON.parse(e.data),chat=document.querySelector('[data-group-id]');if(!chat||chat.dataset.groupId!==d.group_id){document.getElementById('activity-indicator').textContent='New activity';refreshOverview();return}fetch('/fragments/message?group_id='+encodeURIComponent(d.group_id)+'&message_id='+d.message_id).then(function(r){return r.text()}).then(function(fragment){var list=document.getElementById('message-list');if(!list||list.querySelector('[data-message-id="'+d.message_id+'"]'))return;list.insertAdjacentHTML('beforeend',fragment);prune(list,true)})});source.addEventListener('group.changed',function(e){var d=JSON.parse(e.data);document.getElementById('activity-indicator').textContent='Group metadata changed';refreshOpenChat(d.group_id);refreshOverview()});source.addEventListener('group.deleted',function(e){var d=JSON.parse(e.data);document.getElementById('activity-indicator').textContent='Group deleted';refreshOpenChat(d.group_id);refreshOverview()});source.addEventListener('member.changed',function(){document.getElementById('activity-indicator').textContent='Group state changed';refreshOverview()});source.addEventListener('wakeup.changed',function(){document.getElementById('activity-indicator').textContent='Wakeup state changed';refreshOverview()});source.addEventListener('tool_call.completed',function(){refreshOverview();refreshAnalytics()});})();</script></body></html>""".replace("__PICKER__", picker).replace("__PANEL__", render_overview(groups_directory))
