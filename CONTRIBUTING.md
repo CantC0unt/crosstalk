@@ -7,7 +7,7 @@ Thanks for contributing. Crosstalk is a dependency-free Python MCP server, so ch
 Clone the repository and run the test suite:
 
 ```sh
-python3 -m unittest tests/test_main.py
+python3 -m unittest tests/test_main.py tests/test_mcp.py tests/test_observe.py
 ```
 
 No runtime dependencies are required. To install the command locally, run:
