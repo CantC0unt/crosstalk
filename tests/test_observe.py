@@ -237,6 +237,21 @@ class ObserverPollingTests(unittest.TestCase):
         self.assertNotIn("<script>alert", rendered)
         self.assertIn('data-message-id="1"', rendered)
 
+    def test_dashboard_uses_group_names_and_local_timestamps(self):
+        self.store.update_group_metadata(self.group_id, "writer", name="Project launch")
+        self.store.send_message(self.group_id, "writer", "Writer", "first")
+        dashboard = observe.render_dashboard(self.groups_directory)
+        chat = observe.render_chat_panel(self.groups_directory, self.group_id)
+        self.assertIn(">Project launch</button>", dashboard)
+        self.assertIn('title="{}"'.format(self.group_id), dashboard)
+        displayed_time = chat.split("<time>", 1)[1].split("</time>", 1)[0]
+        self.assertRegex(displayed_time, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
+        self.assertNotIn("T", displayed_time[:19])
+        self.assertEqual(
+            observe.format_timestamp("2026-01-01T00:00:00+00:00", local_timezone=observe.timezone(observe.timedelta(hours=5, minutes=30))),
+            "2026-01-01 05:30:00 UTC+05:30 (+0530)",
+        )
+
     def test_chat_renders_wakeup_creation_acknowledgement_and_notification_state(self):
         self.store.join_group(self.group_id, "reader", "Reader")
         self.store.send_message(self.group_id, "writer", "Writer", "please read", priority="urgent")
@@ -252,6 +267,8 @@ class ObserverPollingTests(unittest.TestCase):
         self.assertEqual(observe.OBSERVER_STATIC_ASSETS["/static/observer.css"][0], "text/css; charset=utf-8")
         self.assertIn("htmx.org@2.0.4", dashboard)
         self.assertIn("alpinejs@3.14.8", dashboard)
+        self.assertIn("sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+", dashboard)
+        self.assertIn("sha384-X9kJyAubVxnP0hcA+AMMs21U445qsnqhnUF8EBlEpP3a42Kh/JwWjlv2ZcvGfphb", dashboard)
         self.assertEqual(dashboard.count('integrity="sha384-'), 2)
         self.assertIn("new EventSource('/events')", dashboard)
         self.assertIn("source.addEventListener('snapshot'", dashboard)
