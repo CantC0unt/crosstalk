@@ -71,6 +71,15 @@ class ObserveModuleTests(unittest.TestCase):
     def test_discovery_tolerates_missing_directories(self):
         self.assertEqual(observe.discover_groups(Path("definitely-missing-crosstalk-groups")), [])
 
+    def test_discovery_and_names_prefer_group_catalog(self):
+        with tempfile.TemporaryDirectory() as directory:
+            groups_directory = Path(directory) / "groups"
+            store = mcp.CrosstalkStore(str(groups_directory))
+            group_id = store.create_group("writer", name="Catalogued group")
+            self.assertEqual(observe.discover_groups(groups_directory), [group_id])
+            self.assertEqual(observe.group_catalog_names(groups_directory), {group_id: "Catalogued group"})
+            self.assertEqual(observe.group_display_name(groups_directory, group_id), "Catalogued group")
+
     def test_loopback_server_and_csrf_token(self):
         try:
             server = observe.create_observer_server(0)
@@ -191,8 +200,8 @@ class ObserverPollingTests(unittest.TestCase):
     def test_simultaneous_marker_changes_fan_out_as_individual_events(self):
         hub = observe.EventHub()
         poller = observe.ObserverPoller(self.groups_directory, 0.5, hub)
-        before = (None, "before", (("writer", 0),), ())
-        after = (1, "after", (("writer", 1),), ((1, "writer", None, None),))
+        before = (0, 0, 0, 0)
+        after = (1, 1, 1, 1)
         with patch.object(observe, "group_fingerprint", side_effect=[before, after]):
             poller.poll_once()
             subscriber = hub.subscribe()
@@ -289,6 +298,8 @@ class ObserverPollingTests(unittest.TestCase):
         self.assertIn("sha384-X9kJyAubVxnP0hcA+AMMs21U445qsnqhnUF8EBlEpP3a42Kh/JwWjlv2ZcvGfphb", dashboard)
         self.assertEqual(dashboard.count('integrity="sha384-'), 2)
         self.assertIn("new EventSource('/events')", dashboard)
+        self.assertIn('src="/static/observer-live.js"', dashboard)
+        self.assertEqual(observe.OBSERVER_STATIC_ASSETS["/static/observer-events-worker.js"][0], "application/javascript; charset=utf-8")
         self.assertIn("item.dataset.view===control.dataset.view", dashboard)
         self.assertIn("source.addEventListener('snapshot'", dashboard)
         self.assertIn("'group.deleted'", dashboard)
@@ -309,19 +320,29 @@ class ObserverPollingTests(unittest.TestCase):
         self.assertIn("Messages</strong><span>1", overview)
         self.assertIn("high: <strong>1</strong>", overview)
         self.assertIn("Audit analytics are disabled", overview)
-        self.assertIn('class="group-row" role="link" tabindex="0" data-view="chats" hx-get="/fragments/chats?group_id={}"'.format(self.group_id), overview)
+        self.assertIn('class="group-row" data-overview-group-id="{}" role="link" tabindex="0" data-view="chats" hx-get="/fragments/chats?group_id={}"'.format(self.group_id, self.group_id), overview)
         self.assertIn('data-view="chats" hx-get="/fragments/chats"', overview)
         self.assertIn('data-view="analytics" hx-get="/fragments/analytics?outcome=error"', overview)
 
+    def test_render_overview_collects_group_state_once(self):
+        with patch.object(observe, "collect_overview_groups", wraps=observe.collect_overview_groups) as collect:
+            observe.render_overview(self.groups_directory)
+        collect.assert_called_once_with(self.groups_directory)
+
+    def test_overview_group_row_is_compact_and_addressable(self):
+        self.store.send_message(self.group_id, "writer", "Writer", "hello")
+        row = observe.render_overview_group_row(self.groups_directory, self.group_id)
+        self.assertIn('data-overview-group-id="{}"'.format(self.group_id), row)
+        self.assertIn("<td>1</td>", row)
+        self.assertEqual(observe.render_overview_group_row(self.groups_directory, "invalid"), "")
+
     def test_overview_live_activity_uses_the_500_event_limit(self):
-        snapshot = {"metadata": {"name": "Example"}, "wakeups": []}
-        with patch.object(observe, "discover_groups", return_value=[self.group_id]), \
-             patch.object(observe, "read_group_snapshot", return_value=snapshot), \
-             patch.object(observe, "read_message_page", return_value={"messages": []}) as messages, \
+        group_states = [{"group_id": self.group_id, "snapshot": {"metadata": {"name": "Example"}, "wakeups": []}, "messages": []}]
+        with patch.object(observe, "collect_overview_groups", return_value=group_states) as collect, \
              patch.object(observe, "read_tool_calls", return_value=[]) as tool_calls:
             self.assertEqual(observe.overview_events(self.groups_directory), [])
 
-        messages.assert_called_once_with(self.groups_directory, self.group_id, limit=500)
+        collect.assert_called_once_with(self.groups_directory)
         tool_calls.assert_called_once_with(self.groups_directory, limit=500)
 
     def test_overview_reports_wakeup_responsiveness_after_acknowledgement(self):
@@ -344,6 +365,20 @@ class ObserverPollingTests(unittest.TestCase):
         self.assertEqual(observe.format_error_category("sqlite_busy"), "Database Busy Error")
         self.assertEqual(observe.format_tool_name("send_message"), "Send Message")
 
+    def test_overview_reads_legacy_audit_database_without_rollups(self):
+        database = self.groups_directory / "observability.sqlite3"
+        connection = mcp.sqlite3.connect(str(database))
+        try:
+            connection.execute("CREATE TABLE tool_calls (id INTEGER PRIMARY KEY, occurred_at TEXT NOT NULL, tool_name TEXT NOT NULL, outcome TEXT NOT NULL, duration_ms INTEGER NOT NULL, error_category TEXT)")
+            connection.execute("INSERT INTO tool_calls(occurred_at, tool_name, outcome, duration_ms, error_category) VALUES ('2026-01-01T00:00:00+00:00', 'list_groups', 'error', 17, 'validation')")
+            connection.commit()
+        finally:
+            connection.close()
+
+        reliability = observe.overview_reliability(self.groups_directory)
+
+        self.assertEqual((reliability["calls"], reliability["error_rate"], reliability["latency"]), (1, "100.0%", "17 ms p95"))
+
     def test_overview_reliability_uses_all_calls_and_keeps_the_latest_100_failures(self):
         audit_store = mcp.ObservabilityStore(str(self.groups_directory))
         for index in range(101):
@@ -360,9 +395,9 @@ class ObserverPollingTests(unittest.TestCase):
         audit_store.record_event(mcp.AuditEvent("2026-01-01T13:00:00+00:00", "2", "send_message", self.group_id, "writer", "Writer", "error", 40, None, "validation", None))
         data = observe.read_tool_analytics(self.groups_directory, {"tool_name": "send_message", "name": "Writer", "from": "2026-01-01T00:00:00+00:00"})
         self.assertEqual(len(data["rows"]), 2)
-        self.assertEqual((observe._percentile(data["durations"], .5), observe._percentile(data["durations"], .95)), (12, 40))
-        self.assertEqual(data["by_time"], {"2026-01-01T12:00:00Z": 1, "2026-01-01T13:00:00Z": 1})
-        self.assertEqual(data["interval_seconds"], 10)
+        self.assertEqual((observe._histogram_percentile(data["latency_histogram"], .5), observe._histogram_percentile(data["latency_histogram"], .95)), (12, 40))
+        self.assertEqual(sum(data["by_time"].values()), 2)
+        self.assertEqual(data["interval_seconds"], 86400)
         self.assertEqual(data["by_outcome"], {"Success": 1, "Validation Error": 1})
         validation_only = observe.read_tool_analytics(self.groups_directory, {"outcome": "error:validation"})
         self.assertEqual(len(validation_only["rows"]), 1)

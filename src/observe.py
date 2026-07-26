@@ -2,6 +2,7 @@
 
 import argparse
 import calendar
+import hashlib
 import html
 import json
 from dataclasses import dataclass
@@ -100,9 +101,11 @@ def open_read_only_database(database_path: Path) -> sqlite3.Connection:
 
 
 GROUP_DATABASE_PATTERN = re.compile(r"grp_[0-9a-f]{32}\.sqlite3$")
+OBSERVABILITY_DATABASE_NAME = "observability.sqlite3"
 DEFAULT_MESSAGE_PAGE_SIZE = 100
 MAX_MESSAGE_PAGE_SIZE = 500
 OVERVIEW_EVENT_LIMIT = 500
+OVERVIEW_EVENT_PAGE_SIZE = 100
 ERROR_CATEGORY_LABELS = {
     "validation": "Validation Error",
     "not_found": "Not Found Error",
@@ -288,6 +291,25 @@ OBSERVER_STATIC_ASSETS["/static/observer.css"] += (b"""
 @media(min-width:701px){.workspace #chat-panel>.chats{display:flex;height:100%;min-height:0;flex-direction:column;overflow:hidden}.workspace #chat-panel>.chats>.chats-layout{height:100%;min-height:0;overflow:hidden;flex:1}.chats .chat-detail,.chats .chat{height:100%;min-height:0;overflow:hidden}.chats .chat{grid-template-rows:auto minmax(0,1fr)}.chats .chat>#message-list{height:100%;min-height:0;overflow-y:auto!important;overflow-x:hidden;scrollbar-gutter:stable}.chats .chat-picker{min-height:0;overflow:auto}}
 """,)
 
+# A SharedWorker is scoped to this loopback origin, so all dashboard tabs can
+# receive the live stream through one browser connection rather than each tab
+# consuming an HTTP/1.x EventSource slot.
+OBSERVER_STATIC_ASSETS["/static/observer-events-worker.js"] = (
+    "application/javascript; charset=utf-8",
+    b"""var ports=[],source;
+var eventTypes=['snapshot','message.created','group.changed','group.deleted','member.changed','wakeup.changed','tool_call.completed'];
+function broadcast(type,data){ports=ports.filter(function(port){try{port.postMessage({type:type,data:data});return true}catch(error){return false}})}
+function start(){if(source)return;source=new EventSource('/events');eventTypes.forEach(function(type){source.addEventListener(type,function(event){broadcast(type,event.data)})})}
+onconnect=function(event){var port=event.ports[0];ports.push(port);port.onmessage=function(message){if(message.data==='disconnect'){ports=ports.filter(function(item){return item!==port});if(!ports.length&&source){source.close();source=null}}};port.start();start()};
+""",
+)
+
+OBSERVER_STATIC_ASSETS["/static/observer-live.js"] = (
+    "application/javascript; charset=utf-8",
+    b"""(function(){var NativeEventSource=window.EventSource;if(!window.SharedWorker||!NativeEventSource)return;window.EventSource=function(url){if(url!=='/events')return new NativeEventSource(url);var listeners={},worker=new SharedWorker('/static/observer-events-worker.js'),port=worker.port;port.onmessage=function(event){(listeners[event.data.type]||[]).slice().forEach(function(listener){listener({data:event.data.data})})};port.start();window.addEventListener('pagehide',function(){try{port.postMessage('disconnect');port.close()}catch(error){}},{once:true});return{addEventListener:function(type,listener){(listeners[type]||(listeners[type]=[])).push(listener)},removeEventListener:function(type,listener){var entries=listeners[type]||[],index=entries.indexOf(listener);if(index>=0)entries.splice(index,1)},close:function(){port.postMessage('disconnect');port.close()}}}})();
+""",
+)
+
 
 class _ObserverHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
@@ -296,9 +318,17 @@ class _ObserverHandler(BaseHTTPRequestHandler):
         if asset is not None:
             content_type, *parts = asset
             body = b"\n".join(parts)
+            etag = '"' + hashlib.sha256(body).hexdigest() + '"'
+            if self.headers.get("If-None-Match") == etag:
+                self.send_response(304)
+                self.send_header("ETag", etag)
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                return
             self.send_response(200)
             self.send_header("Content-Type", content_type)
             self.send_header("Cache-Control", "no-cache")
+            self.send_header("ETag", etag)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -345,6 +375,9 @@ class _ObserverHandler(BaseHTTPRequestHandler):
             return
         if request.path == "/fragments/overview":
             self._send_html(render_overview(self.server.groups_directory))
+            return
+        if request.path == "/fragments/overview-group-row":
+            self._send_html(render_overview_group_row(self.server.groups_directory, group_id), 200 if _valid_group_id(group_id) else 400)
             return
         if request.path == "/fragments/analytics":
             self._send_html(render_tool_analytics(self.server.groups_directory, {key: value[0] for key, value in query.items()}))
@@ -525,15 +558,21 @@ class ObserverPoller:
             except (OSError, sqlite3.Error, ValueError):
                 continue
             previous = self._markers.get(group_id)
+            latest_message_id = None
+            if previous is not None and marker[0] != previous[0]:
+                try:
+                    latest_message_id = latest_message_id_for_group(self.groups_directory, group_id)
+                except (OSError, sqlite3.Error, ValueError):
+                    continue
             self._markers[group_id] = marker
             if previous is not None and marker[0] != previous[0]:
-                self.event_hub.publish("message.created", {"group_id": group_id, "message_id": marker[0]})
+                self.event_hub.publish("message.created", {"group_id": group_id, "message_id": latest_message_id})
             if previous is not None and marker[1] != previous[1]:
-                self.event_hub.publish("group.changed", {"group_id": group_id})
-            if previous is not None and marker[2] != previous[2]:
                 self.event_hub.publish("member.changed", {"group_id": group_id})
-            if previous is not None and marker[3] != previous[3]:
+            if previous is not None and marker[2] != previous[2]:
                 self.event_hub.publish("wakeup.changed", {"group_id": group_id})
+            if previous is not None and marker[3] != previous[3]:
+                self.event_hub.publish("group.changed", {"group_id": group_id})
         # A missing directory can be transient while storage is mounted or
         # replaced. Only treat a missing individual file as group deletion.
         if self.groups_directory.is_dir():
@@ -574,10 +613,37 @@ def create_observer_server(port: Optional[int], poll_interval: float = DEFAULT_P
 
 
 def discover_groups(groups_directory: Path) -> List[str]:
-    """Return valid group IDs without creating a missing directory."""
+    """Return valid group IDs, preferring the store-maintained catalog."""
     if not groups_directory.is_dir():
         return []
+    catalog = group_catalog_names(groups_directory)
+    if catalog:
+        # The catalog is authoritative during normal operation, but a file can
+        # briefly disappear while a group is being deleted.
+        return [group_id for group_id in sorted(catalog) if _group_database_path(groups_directory, group_id).is_file()]
     return sorted(path.name[:-8] for path in groups_directory.iterdir() if path.is_file() and GROUP_DATABASE_PATTERN.fullmatch(path.name))
+
+
+def group_catalog_names(groups_directory: Optional[Path]) -> dict:
+    """Read all known group names in one read-only catalog query."""
+    if groups_directory is None:
+        return {}
+    catalog_path = groups_directory / OBSERVABILITY_DATABASE_NAME
+    if not catalog_path.is_file():
+        return {}
+    try:
+        connection = open_read_only_database(catalog_path)
+        try:
+            rows = connection.execute("SELECT group_id, name FROM groups").fetchall()
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error):
+        return {}
+    return {
+        row["group_id"]: str(row["name"] or "Untitled group")
+        for row in rows
+        if _valid_group_id(row["group_id"])
+    }
 
 
 def _valid_group_id(group_id: Optional[str]) -> bool:
@@ -596,7 +662,11 @@ def read_group_snapshot(groups_directory: Path, group_id: str) -> dict:
     connection = open_read_only_database(path)
     try:
         metadata = connection.execute("SELECT name, description, creator_context_id, created_at, updated_at FROM group_metadata WHERE id = 1").fetchone()
-        members = [dict(row) | {"unread_count": len(json.loads(row["unread_message_ids"]))} for row in connection.execute("SELECT context_id, name, joined_at, unread_message_ids FROM group_members ORDER BY joined_at")]
+        member_columns = {row[1] for row in connection.execute("PRAGMA table_info(group_members)")}
+        if "unread_count" in member_columns:
+            members = [dict(row) for row in connection.execute("SELECT context_id, name, joined_at, unread_count FROM group_members ORDER BY joined_at")]
+        else:
+            members = [dict(row) for row in connection.execute("SELECT group_members.context_id, name, joined_at, COUNT(member_unread_messages.message_id) AS unread_count FROM group_members LEFT JOIN member_unread_messages ON member_unread_messages.context_id = group_members.context_id GROUP BY group_members.context_id, name, joined_at ORDER BY joined_at")]
         latest = connection.execute("SELECT id, created_at FROM messages ORDER BY id DESC LIMIT 1").fetchone()
         wakeups = [dict(row) for row in connection.execute("SELECT message_id, context_id, relevance, priority, created_at, acknowledged_at, last_notified_at FROM wakeup_events ORDER BY id")]
         return {"group_id": group_id, "metadata": dict(metadata) if metadata else None, "members": members, "latest_message_id": latest["id"] if latest else None, "latest_activity_at": latest["created_at"] if latest else None, "wakeups": wakeups}
@@ -675,19 +745,38 @@ def latest_audit_id_for_directory(groups_directory: Path) -> Optional[int]:
         return None
     connection = open_read_only_database(path)
     try:
-        row = connection.execute("SELECT MAX(id) FROM tool_calls").fetchone()
+        try:
+            row = connection.execute("SELECT MAX(id) FROM tool_calls").fetchone()
+        except sqlite3.OperationalError:
+            return None
         return row[0] if row is not None else None
     finally:
         connection.close()
 
 
 def group_fingerprint(groups_directory: Path, group_id: str) -> tuple:
-    """Compact deterministic state marker for observer polling."""
-    snapshot = read_group_snapshot(groups_directory, group_id)
-    members = tuple((member["context_id"], member["unread_count"]) for member in snapshot["members"])
-    wakeups = tuple((item["message_id"], item["context_id"], item["acknowledged_at"], item["last_notified_at"]) for item in snapshot["wakeups"])
-    metadata = snapshot["metadata"] or {}
-    return (snapshot["latest_message_id"], metadata.get("updated_at"), members, wakeups)
+    """Read constant-size observer revisions without loading group state."""
+    connection = open_read_only_database(_group_database_path(groups_directory, group_id))
+    try:
+        row = connection.execute(
+            "SELECT message_revision, member_revision, wakeup_revision, metadata_revision "
+            "FROM group_state WHERE id = 1"
+        ).fetchone()
+        if row is None:
+            raise ValueError("Group state marker is missing.")
+        return tuple(row)
+    finally:
+        connection.close()
+
+
+def latest_message_id_for_group(groups_directory: Path, group_id: str) -> Optional[int]:
+    """Read the scalar message cursor only after a message revision changes."""
+    connection = open_read_only_database(_group_database_path(groups_directory, group_id))
+    try:
+        row = connection.execute("SELECT MAX(id) FROM messages").fetchone()
+        return row[0] if row is not None else None
+    finally:
+        connection.close()
 
 
 def observer_snapshot(groups_directory: Path) -> dict:
@@ -695,7 +784,11 @@ def observer_snapshot(groups_directory: Path) -> dict:
     for group_id in discover_groups(groups_directory):
         try:
             marker = group_fingerprint(groups_directory, group_id)
-            groups[group_id] = {"latest_message_id": marker[0], "member_fingerprint": repr(marker[2]), "wakeup_fingerprint": repr(marker[3])}
+            groups[group_id] = {
+                "latest_message_id": latest_message_id_for_group(groups_directory, group_id),
+                "member_fingerprint": str(marker[1]),
+                "wakeup_fingerprint": str(marker[2]),
+            }
         except (OSError, sqlite3.Error, ValueError):
             pass
     try:
@@ -738,6 +831,9 @@ def group_display_name(groups_directory: Optional[Path], group_id: Optional[str]
     """Return a human-readable group name while preserving the ID for routing."""
     if groups_directory is None or not _valid_group_id(group_id):
         return "Untitled group"
+    name = group_catalog_names(groups_directory).get(group_id)
+    if name is not None:
+        return name
     try:
         metadata = read_group_snapshot(groups_directory, group_id)["metadata"] or {}
     except (OSError, sqlite3.Error, ValueError):
@@ -818,59 +914,133 @@ def render_chat_panel(groups_directory: Optional[Path], group_id: Optional[str])
 def render_chats_workspace(groups_directory: Optional[Path], group_id: Optional[str] = None) -> str:
     """Render chat browsing as a dedicated workspace with a persistent group picker."""
     groups = discover_groups(groups_directory) if groups_directory is not None else []
+    group_names = group_catalog_names(groups_directory)
     selected = group_id if group_id in groups else (groups[0] if groups else None)
     picker = "".join(
         '<button class="{}" hx-get="/fragments/chats?group_id={}" hx-target="#chat-panel" hx-swap="innerHTML">{}</button><!-- title="{}" -->'.format(
             "is-active" if item == selected else "", html.escape(item),
-            html.escape(group_display_name(groups_directory, item)), html.escape(item),
+            html.escape(group_names.get(item) or group_display_name(groups_directory, item)), html.escape(item),
         ) for item in groups
     ) or '<p class="notice">No groups found. This page will update when a group database appears.</p>'
     detail = render_chat_panel(groups_directory, selected)
     return '<section class="view chats" data-chats="true" data-page-title="Chats" data-page-description="Read-only conversation history and participant state."><header class="view-header"><div><h2>Chats</h2><p>Read-only conversation history and participant state.</p></div></header><div class="chats-layout"><aside class="chat-picker"><h3>Groups</h3><div class="chat-list">{}</div></aside><div class="chat-detail">{}</div></div></section>'.format(picker, detail)
 
 
-def overview_data(groups_directory: Optional[Path]) -> dict:
+def collect_overview_groups(groups_directory: Optional[Path], message_limit: int = 0) -> List[dict]:
+    """Collect each group's Overview inputs through one read-only connection."""
+    if groups_directory is None:
+        return []
+    groups = []
+    for group_id in discover_groups(groups_directory):
+        try:
+            connection = open_read_only_database(_group_database_path(groups_directory, group_id))
+            try:
+                metadata = connection.execute("SELECT name, description, creator_context_id, created_at, updated_at FROM group_metadata WHERE id = 1").fetchone()
+                member_columns = {row[1] for row in connection.execute("PRAGMA table_info(group_members)")}
+                if "unread_count" in member_columns:
+                    members = [dict(row) for row in connection.execute("SELECT context_id, name, joined_at, unread_count FROM group_members ORDER BY joined_at")]
+                else:
+                    members = [dict(row) for row in connection.execute("SELECT group_members.context_id, name, joined_at, COUNT(member_unread_messages.message_id) AS unread_count FROM group_members LEFT JOIN member_unread_messages ON member_unread_messages.context_id = group_members.context_id GROUP BY group_members.context_id, name, joined_at ORDER BY joined_at")]
+                latest = connection.execute("SELECT id, created_at FROM messages ORDER BY id DESC LIMIT 1").fetchone()
+                wakeup_summary = dict(connection.execute(
+                    "SELECT "
+                    "SUM(CASE WHEN acknowledged_at IS NULL THEN 1 ELSE 0 END) AS pending_count, "
+                    "SUM(CASE WHEN acknowledged_at IS NOT NULL AND created_at IS NOT NULL THEN 1 ELSE 0 END) AS acknowledged_count, "
+                    "SUM(CASE WHEN acknowledged_at IS NOT NULL AND created_at IS NOT NULL "
+                    "THEN (julianday(acknowledged_at) - julianday(created_at)) * 86400 ELSE 0 END) AS response_seconds "
+                    "FROM wakeup_events"
+                ).fetchone())
+                recent_wakeups = []
+                if message_limit:
+                    recent_wakeups = [dict(row) for row in connection.execute(
+                        "SELECT message_id, context_id, relevance, priority, created_at, acknowledged_at, last_notified_at "
+                        "FROM wakeup_events ORDER BY id DESC LIMIT ?",
+                        (min(message_limit, MAX_MESSAGE_PAGE_SIZE),),
+                    )]
+                tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+                if "group_message_metrics" in tables:
+                    priorities = dict(connection.execute(
+                        "SELECT value, count FROM group_message_metrics WHERE metric = 'priority'"
+                    ))
+                    routing = dict(connection.execute(
+                        "SELECT value, count FROM group_message_metrics WHERE metric = 'routing'"
+                    ))
+                else:
+                    priorities = dict(connection.execute("SELECT COALESCE(priority, 'normal'), COUNT(*) FROM messages GROUP BY priority"))
+                    routing = dict(connection.execute("SELECT COALESCE(routing_reason, 'normal'), COUNT(*) FROM messages GROUP BY routing_reason"))
+                messages = []
+                if message_limit:
+                    rows = connection.execute(
+                        "SELECT id, sender_context_id, sender_name, content, created_at, priority, mentions, wakeup_targets, routing_reason FROM messages ORDER BY id DESC LIMIT ?",
+                        (min(message_limit, MAX_MESSAGE_PAGE_SIZE),),
+                    ).fetchall()
+                    messages = [dict(row) for row in reversed(rows)]
+            finally:
+                connection.close()
+            groups.append({
+                "group_id": group_id,
+                "snapshot": {"group_id": group_id, "metadata": dict(metadata) if metadata else None, "members": members,
+                             "latest_message_id": latest["id"] if latest else None,
+                             "latest_activity_at": latest["created_at"] if latest else None},
+                "priorities": priorities, "routing": routing, "messages": messages,
+                "wakeup_summary": {key: value or 0 for key, value in wakeup_summary.items()},
+                "recent_wakeups": recent_wakeups,
+            })
+        except (OSError, sqlite3.Error, ValueError, json.JSONDecodeError):
+            groups.append({"group_id": group_id, "unavailable": True})
+    return groups
+
+
+def overview_data(groups_directory: Optional[Path], group_states: Optional[List[dict]] = None) -> dict:
     """Derive small, current overview metrics directly from read-only databases."""
     totals = {"groups": 0, "contexts": 0, "messages": 0, "members": 0, "unread": 0, "pending_wakeups": 0, "wakeup_response": "—", "acknowledged_wakeups": 0, "tool_calls": "—", "error_rate": "—"}
     priorities: dict = {}
     routing: dict = {}
     activity: List[dict] = []
     contexts = set()
-    wakeup_response_seconds: List[float] = []
     if groups_directory is None:
         return {"totals": totals, "priorities": priorities, "routing": routing, "activity": activity, "audit": None}
-    for group_id in discover_groups(groups_directory):
+    group_states = collect_overview_groups(groups_directory) if group_states is None else group_states
+    for group in group_states:
+        if group.get("unavailable"):
+            continue
+        snapshot = group["snapshot"]
+        group_id = group["group_id"]
         try:
-            snapshot = read_group_snapshot(groups_directory, group_id)
             totals["groups"] += 1
             totals["members"] += len(snapshot["members"])
             totals["unread"] += sum(member["unread_count"] for member in snapshot["members"])
-            totals["pending_wakeups"] += sum(1 for wakeup in snapshot["wakeups"] if wakeup.get("acknowledged_at") is None)
-            for wakeup in snapshot["wakeups"]:
-                if not wakeup.get("created_at") or not wakeup.get("acknowledged_at"):
-                    continue
-                try:
-                    response = (datetime.fromisoformat(wakeup["acknowledged_at"]) - datetime.fromisoformat(wakeup["created_at"])).total_seconds()
-                except ValueError:
-                    continue
-                wakeup_response_seconds.append(max(0, response))
+            wakeups = group.get("wakeup_summary")
+            if wakeups is None:
+                legacy_wakeups = snapshot.get("wakeups", [])
+                acknowledged = [wakeup for wakeup in legacy_wakeups if wakeup.get("acknowledged_at") and wakeup.get("created_at")]
+                response_seconds = 0.0
+                acknowledged_count = 0
+                for wakeup in acknowledged:
+                    try:
+                        response_seconds += max(0, (datetime.fromisoformat(wakeup["acknowledged_at"]) - datetime.fromisoformat(wakeup["created_at"])).total_seconds())
+                        acknowledged_count += 1
+                    except ValueError:
+                        pass
+                wakeups = {"pending_count": sum(1 for wakeup in legacy_wakeups if wakeup.get("acknowledged_at") is None),
+                           "acknowledged_count": acknowledged_count, "response_seconds": response_seconds}
+            totals["pending_wakeups"] += int(wakeups["pending_count"])
+            totals["acknowledged_wakeups"] += int(wakeups["acknowledged_count"])
+            totals.setdefault("wakeup_response_seconds", 0.0)
+            totals["wakeup_response_seconds"] += float(wakeups["response_seconds"])
             contexts.update(member["context_id"] for member in snapshot["members"])
             if snapshot["latest_message_id"] is not None:
                 activity.append({"group_id": group_id, "group_name": str((snapshot["metadata"] or {}).get("name") or "Untitled group"), "created_at": snapshot["latest_activity_at"], "message_id": snapshot["latest_message_id"]})
-            connection = open_read_only_database(_group_database_path(groups_directory, group_id))
-            try:
-                for priority, count in connection.execute("SELECT COALESCE(priority, 'normal'), COUNT(*) FROM messages GROUP BY priority"):
-                    priorities[priority] = priorities.get(priority, 0) + count
-                    totals["messages"] += count
-                for reason, count in connection.execute("SELECT COALESCE(routing_reason, 'normal'), COUNT(*) FROM messages GROUP BY routing_reason"):
-                    routing[reason] = routing.get(reason, 0) + count
-            finally:
-                connection.close()
+            for priority, count in group["priorities"].items():
+                priorities[priority] = priorities.get(priority, 0) + count
+                totals["messages"] += count
+            for reason, count in group["routing"].items():
+                routing[reason] = routing.get(reason, 0) + count
         except (OSError, sqlite3.Error, ValueError):
             continue
     totals["contexts"] = len(contexts)
-    totals["wakeup_response"] = "—" if not wakeup_response_seconds else "{:.1f}s avg".format(sum(wakeup_response_seconds) / len(wakeup_response_seconds))
-    totals["acknowledged_wakeups"] = len(wakeup_response_seconds)
+    response_seconds = totals.pop("wakeup_response_seconds", 0.0)
+    totals["wakeup_response"] = "—" if not totals["acknowledged_wakeups"] else "{:.1f}s avg".format(response_seconds / totals["acknowledged_wakeups"])
     activity.sort(key=lambda item: item["created_at"] or "", reverse=True)
     try:
         audit = read_audit_metadata(groups_directory)
@@ -878,13 +1048,9 @@ def overview_data(groups_directory: Optional[Path]) -> dict:
         audit = None
     if audit is not None:
         try:
-            connection = open_read_only_database(groups_directory / "observability.sqlite3")
-            try:
-                call_count, error_count = connection.execute("SELECT COUNT(*), COALESCE(SUM(outcome = 'error'), 0) FROM tool_calls").fetchone()
-            finally:
-                connection.close()
-            totals["tool_calls"] = call_count
-            totals["error_rate"] = "{:.1f}%".format(error_count * 100 / call_count) if call_count else "0.0%"
+            summary = read_audit_rollup_summary(groups_directory)
+            totals["tool_calls"] = summary["calls"]
+            totals["error_rate"] = summary["error_rate"]
         except (OSError, sqlite3.Error, ValueError):
             pass
     return {"totals": totals, "priorities": priorities, "routing": routing, "activity": activity[:10], "audit": audit}
@@ -912,16 +1078,20 @@ def _legacy_render_overview(groups_directory: Optional[Path]) -> str:
     return '<section class="view overview" data-overview="true"><header class="view-header"><div><p class="eyebrow">Live operations</p><h2>Overview</h2><p>What needs attention across your local Crosstalk groups.</p></div>{}</header><div class="metrics">{}</div><div class="attention-grid"><section class="card"><h3>Attention now</h3><ul class="attention-list">{}</ul></section><section class="card"><h3>Recent activity</h3><ul class="activity-list">{}</ul></section></div><div class="overview-columns"><section class="card"><h3>Message priority</h3><ul>{}</ul></section><section class="card"><h3>Routing</h3><ul>{}</ul><h3>Wakeup responsiveness</h3><p class="notice">{}</p></section></div></section>'.format(audit_notice, metrics, "".join(attention), activity, breakdown(data["priorities"]), breakdown(data["routing"]), responsiveness)
 
 
-def overview_group_rows(groups_directory: Optional[Path]) -> List[dict]:
+def overview_group_rows(groups_directory: Optional[Path], group_states: Optional[List[dict]] = None) -> List[dict]:
     """Read compact, current group state for the operational status table."""
     rows: List[dict] = []
     if groups_directory is None:
         return rows
-    for group_id in discover_groups(groups_directory):
+    group_states = collect_overview_groups(groups_directory) if group_states is None else group_states
+    for group in group_states:
+        group_id = group["group_id"]
         try:
-            snapshot = read_group_snapshot(groups_directory, group_id)
+            if group.get("unavailable"):
+                raise ValueError("Group is unavailable.")
+            snapshot = group["snapshot"]
             members = snapshot["members"]
-            pending = sum(1 for wakeup in snapshot["wakeups"] if wakeup.get("acknowledged_at") is None)
+            pending = int(group.get("wakeup_summary", {"pending_count": sum(1 for wakeup in snapshot.get("wakeups", []) if wakeup.get("acknowledged_at") is None)})["pending_count"])
             unread = sum(member["unread_count"] for member in members)
             if pending:
                 state, state_class = "Needs attention", "attention"
@@ -945,32 +1115,109 @@ def overview_group_rows(groups_directory: Optional[Path]) -> List[dict]:
     return sorted(rows, key=lambda row: (row["state"] == "Healthy", row["name"].lower()))
 
 
-def overview_events(groups_directory: Optional[Path], limit: int = OVERVIEW_EVENT_LIMIT) -> List[dict]:
+def overview_group_row(groups_directory: Optional[Path], group_id: Optional[str]) -> Optional[dict]:
+    """Read only the fields required to refresh one Overview table row."""
+    if groups_directory is None or not _valid_group_id(group_id):
+        return None
+    try:
+        connection = open_read_only_database(_group_database_path(groups_directory, group_id))
+        try:
+            metadata = connection.execute("SELECT name FROM group_metadata WHERE id = 1").fetchone()
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(group_members)")}
+            if "unread_count" in columns:
+                member_count, unread = connection.execute("SELECT COUNT(*), COALESCE(SUM(unread_count), 0) FROM group_members").fetchone()
+            else:
+                member_count, unread = connection.execute("SELECT COUNT(DISTINCT group_members.context_id), COUNT(member_unread_messages.message_id) FROM group_members LEFT JOIN member_unread_messages ON member_unread_messages.context_id = group_members.context_id").fetchone()
+            pending = connection.execute("SELECT COUNT(*) FROM wakeup_events WHERE acknowledged_at IS NULL").fetchone()[0]
+            latest = connection.execute("SELECT created_at FROM messages ORDER BY id DESC LIMIT 1").fetchone()
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error, ValueError):
+        return None
+    if pending:
+        state, state_class = "Needs attention", "attention"
+    elif unread:
+        state, state_class = "Unread", "attention"
+    else:
+        state, state_class = "Healthy", ""
+    return {"id": group_id, "name": str(metadata[0] if metadata else "Untitled group"), "members": member_count,
+            "unread": unread, "pending": pending, "latest": format_timestamp(latest[0] if latest else None, "No activity"),
+            "state": state, "state_class": state_class}
+
+
+def render_overview_group_row(groups_directory: Optional[Path], group_id: Optional[str]) -> str:
+    row = overview_group_row(groups_directory, group_id)
+    if row is None:
+        return ""
+    return _render_overview_group_row(row)
+
+
+def _render_overview_group_row(row: dict) -> str:
+    return ('<tr class="group-row" data-overview-group-id="{id}" role="link" tabindex="0" data-view="chats" '
+            'hx-get="/fragments/chats?group_id={id}" hx-trigger="click, keyup[key==\'Enter\']" hx-target="#chat-panel" hx-swap="innerHTML">'
+            '<td class="group-name">{name}</td><td>{members}</td><td>{unread}</td><td>{pending}</td><td>{latest}</td>'
+            '<td><span class="status {state_class}">{state}</span></td></tr>').format(
+                id=html.escape(str(row["id"]), quote=True), name=html.escape(str(row["name"])), members=row["members"],
+                unread=row["unread"], pending=row["pending"], latest=html.escape(str(row["latest"])),
+                state_class=row["state_class"], state=html.escape(str(row["state"])))
+
+
+def overview_events(groups_directory: Optional[Path], limit: int = OVERVIEW_EVENT_LIMIT,
+                    group_states: Optional[List[dict]] = None) -> List[dict]:
     """Assemble a bounded cross-group operational stream from existing stores."""
     events: List[dict] = []
     if groups_directory is None:
         return events
-    for group_id in discover_groups(groups_directory):
+    group_states = collect_overview_groups(groups_directory) if group_states is None else group_states
+    sources = []
+    for group in group_states:
+        group_id = group["group_id"]
         try:
-            snapshot = read_group_snapshot(groups_directory, group_id)
+            if group.get("unavailable"):
+                continue
+            snapshot = group["snapshot"]
             group_name = str((snapshot["metadata"] or {}).get("name") or "Untitled group")
-            page = read_message_page(groups_directory, group_id, limit=min(limit, MAX_MESSAGE_PAGE_SIZE))
-            for message in page["messages"]:
-                content = str(message.get("content") or "")
-                events.append({"type": "message", "created_at": message.get("created_at"), "group_id": group_id,
-                               "group_name": group_name, "sender": message.get("sender_name") or message.get("sender_context_id") or "Unknown",
-                               "content": content[:180] + ("…" if len(content) > 180 else ""), "detail": "Message"})
-            for wakeup in snapshot["wakeups"]:
-                events.append({"type": "wakeup", "created_at": wakeup.get("created_at"), "group_id": group_id,
-                               "group_name": group_name, "sender": wakeup.get("context_id") or "Context",
-                               "content": "Wakeup for message #{}{}".format(wakeup.get("message_id") or "—", " acknowledged" if wakeup.get("acknowledged_at") else " awaiting acknowledgement"),
-                               "detail": "Wakeup", "attention": wakeup.get("acknowledged_at") is None})
+            sources.extend(((group_id, group_name, "messages", 0), (group_id, group_name, "wakeups", 0)))
             updated = (snapshot["metadata"] or {}).get("updated_at")
             if updated:
                 events.append({"type": "group", "created_at": updated, "group_id": group_id, "group_name": group_name,
                                "sender": "Group", "content": "Group settings or membership changed", "detail": "Group change"})
         except (OSError, sqlite3.Error, ValueError):
             continue
+    def load_page(group_id: str, group_name: str, source: str, offset: int) -> tuple:
+        connection = open_read_only_database(_group_database_path(groups_directory, group_id))
+        try:
+            if source == "messages":
+                rows = [dict(row) for row in connection.execute(
+                    "SELECT sender_context_id, sender_name, content, created_at FROM messages ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                    (OVERVIEW_EVENT_PAGE_SIZE, offset))]
+                page = [{"type": "message", "created_at": row.get("created_at"), "group_id": group_id, "group_name": group_name,
+                         "sender": row.get("sender_name") or row.get("sender_context_id") or "Unknown",
+                         "content": str(row.get("content") or "")[:180], "detail": "Message"} for row in rows]
+            else:
+                rows = [dict(row) for row in connection.execute(
+                    "SELECT message_id, context_id, created_at, acknowledged_at FROM wakeup_events ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                    (OVERVIEW_EVENT_PAGE_SIZE, offset))]
+                page = [{"type": "wakeup", "created_at": row.get("created_at"), "group_id": group_id, "group_name": group_name,
+                         "sender": row.get("context_id") or "Context", "content": "Wakeup for message #{}{}".format(row.get("message_id") or "—", " acknowledged" if row.get("acknowledged_at") else " awaiting acknowledgement"),
+                         "detail": "Wakeup", "attention": row.get("acknowledged_at") is None} for row in rows]
+        finally:
+            connection.close()
+        return page, len(page) == OVERVIEW_EVENT_PAGE_SIZE
+    pending = list(sources)
+    while pending:
+        next_pending = []
+        for group_id, group_name, source, offset in pending:
+            try:
+                page, full = load_page(group_id, group_name, source, offset)
+            except (OSError, sqlite3.Error, ValueError):
+                continue
+            events.extend(page)
+            if full:
+                next_pending.append((group_id, group_name, source, offset + OVERVIEW_EVENT_PAGE_SIZE, page[-1].get("created_at") or ""))
+        ranked = sorted(events, key=lambda item: item.get("created_at") or "", reverse=True)
+        cutoff = ranked[limit - 1].get("created_at") if len(ranked) >= limit else None
+        pending = [item[:4] for item in next_pending if cutoff is None or item[4] >= cutoff]
     try:
         for call in read_tool_calls(groups_directory, limit=limit):
             failed = call.get("outcome") == "error"
@@ -990,7 +1237,6 @@ def overview_reliability(groups_directory: Optional[Path]) -> dict:
     try:
         connection = open_read_only_database(groups_directory / "observability.sqlite3")
         try:
-            calls = [dict(row) for row in connection.execute("SELECT outcome, duration_ms FROM tool_calls")]
             failures = [dict(row) for row in connection.execute(
                 "SELECT occurred_at, tool_name, duration_ms, error_category FROM tool_calls WHERE outcome = 'error' ORDER BY occurred_at DESC, id DESC LIMIT 100"
             )]
@@ -998,10 +1244,9 @@ def overview_reliability(groups_directory: Optional[Path]) -> dict:
             connection.close()
     except (OSError, sqlite3.Error, ValueError):
         return {"available": False, "calls": 0, "error_rate": "—", "latency": "—", "failures": []}
-    errors = [call for call in calls if call.get("outcome") == "error"]
-    durations = [call.get("duration_ms") for call in calls if isinstance(call.get("duration_ms"), int)]
-    return {"available": True, "calls": len(calls), "error_rate": "{:.1f}%".format(100 * len(errors) / len(calls)) if calls else "0.0%",
-            "latency": "{} ms p95".format(_percentile(durations, .95)) if durations else "—", "failures": failures}
+    summary = read_audit_rollup_summary(groups_directory)
+    return {"available": True, "calls": summary["calls"], "error_rate": summary["error_rate"],
+            "latency": "{} ms p95".format(summary["p95"]) if summary["p95"] is not None else "—", "failures": failures}
 
 
 def format_error_category(category: object) -> str:
@@ -1015,17 +1260,18 @@ def format_tool_name(tool_name: object) -> str:
 
 
 def render_overview(groups_directory: Optional[Path]) -> str:
-    data = overview_data(groups_directory)
+    group_states = collect_overview_groups(groups_directory)
+    data = overview_data(groups_directory, group_states)
     totals = data["totals"]
     metric_labels = (("Groups", "groups"), ("Contexts", "contexts"), ("Messages", "messages"), ("Tool calls", "tool_calls"), ("Error rate", "error_rate"), ("Wakeup response", "wakeup_response"))
     metrics = "".join('<article class="metric"><strong>{}</strong><span>{}</span></article>'.format(html.escape(label), totals[key]) for label, key in metric_labels)
-    events = overview_events(groups_directory)
+    events = overview_events(groups_directory, group_states=group_states)
     activity = "".join('<li class="event event-{type}{attention}"><span class="event-kind">{detail}</span><div><strong>{sender}</strong> <span class="event-group">{group}</span><p>{content}</p><small>{created}</small></div></li>'.format(
         type=html.escape(str(event["type"])), attention=" is-attention" if event.get("attention") else "",
         detail=html.escape(str(event["detail"])), sender=html.escape(str(event["sender"])), group=html.escape(str(event["group_name"])),
         content=html.escape(str(event["content"])), created=html.escape(format_timestamp(event.get("created_at"), ""))) for event in events) or '<li class="empty-row">No operational events yet.</li>'
-    rows = overview_group_rows(groups_directory)
-    table_rows = "".join('<tr class="group-row" role="link" tabindex="0" data-view="chats" hx-get="/fragments/chats?group_id={id}" hx-trigger="click, keyup[key==\'Enter\']" hx-target="#chat-panel" hx-swap="innerHTML"><td class="group-name">{name}</td><td>{members}</td><td>{unread}</td><td>{pending}</td><td>{latest}</td><td><span class="status {state_class}">{state}</span></td></tr>'.format(id=html.escape(str(row["id"]), quote=True), name=html.escape(str(row["name"])), members=row["members"], unread=row["unread"], pending=row["pending"], latest=html.escape(str(row["latest"])), state_class=row["state_class"], state=html.escape(str(row["state"]))) for row in rows) or '<tr><td colspan="6" class="notice">No groups found.</td></tr>'
+    rows = overview_group_rows(groups_directory, group_states)
+    table_rows = "".join(_render_overview_group_row(row) for row in rows) or '<tr><td colspan="6" class="notice">No groups found.</td></tr>'
     reliability = overview_reliability(groups_directory)
     failures = "".join('<li class="failure"><strong>{}</strong><span>{} · {} ms</span><small>{}</small></li>'.format(html.escape(format_tool_name(row.get("tool_name"))), html.escape(format_error_category(row.get("error_category"))), html.escape(str(row.get("duration_ms") or 0)), html.escape(format_timestamp(row.get("occurred_at"), ""))) for row in reliability["failures"]) or '<li class="empty-row">No recent tool failures.</li>'
     reliability_body = '<p class="notice error">Audit analytics are disabled. Audit data is unavailable; enable observability to monitor MCP reliability.</p>' if not reliability["available"] else '<div class="reliability-metrics"><span><b>{}</b> calls</span><span><b>{}</b> error rate</span><span><b>{}</b></span></div><ul class="failure-list">{}</ul>'.format(reliability["calls"], reliability["error_rate"], html.escape(reliability["latency"]), failures)
@@ -1037,6 +1283,7 @@ def render_overview(groups_directory: Optional[Path]) -> str:
 ANALYTICS_FILTERS = ("from", "to", "group_id", "context_id", "name", "tool_name", "outcome")
 ANALYTICS_RANGE_UNITS = (("s", "seconds"), ("m", "minutes"), ("h", "hours"), ("d", "days"), ("M", "months"), ("Y", "years"))
 ANALYTICS_RANGE_UNIT_MAP = dict(ANALYTICS_RANGE_UNITS)
+ANALYTICS_ROLLUPS = (("1m", 60), ("1h", 3600), ("1d", 86400), ("30d", 30 * 86400))
 
 
 def analytics_range_start(value: object, unit: object, now: Optional[datetime] = None) -> Optional[datetime]:
@@ -1072,12 +1319,27 @@ def analytics_filter_options(groups_directory: Optional[Path]) -> dict:
     try:
         connection = open_read_only_database(groups_directory / "observability.sqlite3")
         try:
+            tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            if "analytics_filter_values" in tables:
+                values = [tuple(row) for row in connection.execute(
+                    "SELECT field, value, label FROM analytics_filter_values WHERE count > 0 ORDER BY label"
+                )]
+                options["tool_name"] = [str(value) for field, value, _label in values if field == "tool_name"]
+                options["name"] = [str(value) for field, value, _label in values if field == "name"]
+                groups = []
+                for field, group_id, stored_name in values:
+                    if field != "group_id":
+                        continue
+                    deleted = not (groups_directory / (str(group_id) + ".sqlite3")).is_file()
+                    name = str(stored_name or group_display_name(groups_directory, group_id))
+                    groups.append((str(group_id), name + " (deleted)" if deleted else name))
+                options["group_id"] = sorted(groups, key=lambda item: item[1].lower())
+                return options
             for field in ("tool_name", "name"):
                 rows = connection.execute(
                     "SELECT DISTINCT {0} FROM tool_calls WHERE {0} IS NOT NULL AND {0} != '' ORDER BY {0}".format(field)
                 )
                 options[field] = [str(row[0]) for row in rows]
-            tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
             query = "SELECT tool_calls.group_id, NULL AS group_name FROM tool_calls WHERE tool_calls.group_id IS NOT NULL AND tool_calls.group_id != '' GROUP BY tool_calls.group_id"
             if "tool_call_group_names" in tables:
                 query = "SELECT tool_calls.group_id, MAX(tool_call_group_names.group_name) AS group_name FROM tool_calls LEFT JOIN tool_call_group_names ON tool_call_group_names.tool_call_id = tool_calls.id WHERE tool_calls.group_id IS NOT NULL AND tool_calls.group_id != '' GROUP BY tool_calls.group_id"
@@ -1121,12 +1383,99 @@ def _analytics_bucket(timestamp: str, interval_seconds: int) -> str:
     return bucket.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _analytics_rollup(filters: dict) -> tuple:
+    start, end = filters.get("from"), filters.get("to")
+    try:
+        start_at = datetime.fromisoformat(str(start).replace("Z", "+00:00")) if start else None
+        end_at = datetime.fromisoformat(str(end).replace("Z", "+00:00")) if end else datetime.now(timezone.utc)
+        if start_at and start_at.tzinfo is None: start_at = start_at.replace(tzinfo=timezone.utc)
+        if end_at.tzinfo is None: end_at = end_at.replace(tzinfo=timezone.utc)
+        span = (end_at - start_at).total_seconds() if start_at else float("inf")
+    except ValueError:
+        span = float("inf")
+    return next(((name, seconds) for name, seconds in ANALYTICS_ROLLUPS if span <= seconds * 360), ANALYTICS_ROLLUPS[-1])
+
+
+def _analytics_where(filters: dict, seconds: int) -> tuple:
+    clauses, values = [], []
+    for field in ANALYTICS_FILTERS:
+        value = filters.get(field)
+        if not value:
+            continue
+        if field in {"from", "to"}:
+            try:
+                parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                if parsed.tzinfo is None: parsed = parsed.replace(tzinfo=timezone.utc)
+                epoch = int(parsed.timestamp())
+            except ValueError:
+                continue
+            clauses.append("bucket_start + ? > ?" if field == "from" else "bucket_start <= ?")
+            values.extend((seconds, epoch) if field == "from" else (epoch,))
+        elif field == "outcome" and str(value).startswith("error:"):
+            clauses.extend(("outcome = ?", "error_category = ?")); values.extend(("error", str(value).split(":", 1)[1]))
+        else:
+            clauses.append(field + " = ?"); values.append(value)
+    return (" WHERE " + " AND ".join(clauses) if clauses else "", values)
+
+
+def _latency_value(bucket: str) -> int:
+    return int(bucket.split(":", 1)[1]) if bucket.startswith("exact:") else 1 << int(bucket.split(":", 1)[1])
+
+
+def _histogram_percentile(rows: List[tuple], percentile: float) -> Optional[int]:
+    total = sum(count for _, count in rows)
+    if not total:
+        return None
+    target = math.ceil(total * percentile)
+    seen = 0
+    for bucket, count in sorted(rows, key=lambda row: _latency_value(row[0])):
+        seen += count
+        if seen >= target:
+            return _latency_value(bucket)
+    return None
+
+
+def read_audit_rollup_summary(groups_directory: Path) -> dict:
+    """Read full-history reliability metrics from the coarsest rollup tier."""
+    connection = open_read_only_database(groups_directory / "observability.sqlite3")
+    try:
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        if {"analytics_30d", "analytics_latency_30d"}.issubset(tables):
+            calls, errors = connection.execute(
+                "SELECT COALESCE(SUM(call_count), 0), COALESCE(SUM(error_count), 0) FROM analytics_30d"
+            ).fetchone()
+            histogram = list(connection.execute(
+                "SELECT latency_bucket, SUM(sample_count) FROM analytics_latency_30d GROUP BY latency_bucket"
+            ))
+        else:
+            # The observer is read-only, so it cannot migrate an audit database
+            # itself.  Older databases remain useful until the MCP server
+            # performs that migration on its next start.
+            calls, errors = connection.execute(
+                "SELECT COUNT(*), COALESCE(SUM(outcome = 'error'), 0) FROM tool_calls"
+            ).fetchone()
+            histogram = [
+                ("exact:" + str(duration), count) if duration <= 1000 else ("log:" + str(duration.bit_length() - 1), count)
+                for duration, count in connection.execute(
+                    "SELECT duration_ms, COUNT(*) FROM tool_calls GROUP BY duration_ms"
+                )
+            ]
+    finally:
+        connection.close()
+    return {"calls": calls, "error_rate": "{:.1f}%".format(errors * 100 / calls) if calls else "0.0%",
+            "p95": _histogram_percentile(histogram, .95)}
+
+
 def read_tool_analytics(groups_directory: Optional[Path], filters: Optional[dict] = None) -> dict:
     """Filter raw audit calls and derive dashboard metrics without aggregate tables."""
     filters = filters or {}
     if groups_directory is None or not (groups_directory / "observability.sqlite3").is_file():
-        return {"available": False, "rows": [], "by_tool": {}, "by_caller": {}, "by_time": {}, "by_outcome": {}, "durations": [], "interval_seconds": 3600}
-    clauses, values = [], []
+        return {"available": False, "rows": [], "by_tool": {}, "by_caller": {}, "by_time": {}, "by_outcome": {}, "latency_histogram": [], "interval_seconds": 3600}
+    resolution, interval_seconds = _analytics_rollup(filters)
+    clauses, values = _analytics_where(filters, interval_seconds)
+    table = "analytics_" + resolution
+    latency_table = "analytics_latency_" + resolution
+    raw_clauses, raw_values = [], []
     for field in ANALYTICS_FILTERS:
         value = filters.get(field)
         if not value:
@@ -1134,46 +1483,41 @@ def read_tool_analytics(groups_directory: Optional[Path], filters: Optional[dict
         if field == "outcome" and str(value).startswith("error:"):
             category = str(value).split(":", 1)[1]
             if category in ERROR_CATEGORY_LABELS:
-                clauses.extend(("outcome = ?", "error_category = ?"))
-                values.extend(("error", category))
+                raw_clauses.extend(("outcome = ?", "error_category = ?")); raw_values.extend(("error", category))
                 continue
         column = "occurred_at" if field in {"from", "to"} else field
         operator = ">=" if field == "from" else "<=" if field == "to" else "="
-        clauses.append(column + " " + operator + " ?")
-        values.append(value)
-    query = "SELECT tool_calls.id, occurred_at, tool_name, group_id, NULL AS group_name, context_id, name, outcome, duration_ms, error_category FROM tool_calls"
-    if clauses:
-        query += " WHERE " + " AND ".join(clauses)
-    query += " ORDER BY occurred_at DESC"
+        raw_clauses.append(column + " " + operator + " ?"); raw_values.append(value)
+    raw_query = "SELECT tool_calls.id, occurred_at, tool_name, group_id, NULL AS group_name, context_id, name, outcome, duration_ms, error_category FROM tool_calls"
+    if raw_clauses: raw_query += " WHERE " + " AND ".join(raw_clauses)
+    raw_query += " ORDER BY occurred_at DESC LIMIT 500"
     try:
         connection = open_read_only_database(groups_directory / "observability.sqlite3")
         try:
             tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-            if "tool_call_group_names" in tables:
-                query = query.replace("NULL AS group_name", "tool_call_group_names.group_name").replace("FROM tool_calls", "FROM tool_calls LEFT JOIN tool_call_group_names ON tool_call_group_names.tool_call_id = tool_calls.id")
-            rows = [dict(row) for row in connection.execute(query, values)]
+            if "tool_call_group_names" in tables: raw_query = raw_query.replace("NULL AS group_name", "tool_call_group_names.group_name").replace("FROM tool_calls", "FROM tool_calls LEFT JOIN tool_call_group_names ON tool_call_group_names.tool_call_id = tool_calls.id")
+            rows = [dict(row) for row in connection.execute(raw_query, raw_values)]
+            aggregate = list(connection.execute("SELECT tool_name, name, outcome, error_category, bucket_start, SUM(call_count), SUM(error_count) FROM " + table + clauses + " GROUP BY tool_name, name, outcome, error_category, bucket_start", values))
+            histogram = list(connection.execute("SELECT latency_bucket, SUM(sample_count) FROM " + latency_table + clauses + " GROUP BY latency_bucket", values))
         finally:
             connection.close()
     except (OSError, sqlite3.Error, ValueError):
-        return {"available": False, "rows": [], "by_tool": {}, "by_caller": {}, "by_time": {}, "by_outcome": {}, "durations": [], "interval_seconds": 3600}
+        return {"available": False, "rows": [], "by_tool": {}, "by_caller": {}, "by_time": {}, "by_outcome": {}, "latency_histogram": [], "interval_seconds": 3600}
     by_tool: dict = {}
     by_caller: dict = {}
     by_time: dict = {}
     by_outcome: dict = {}
-    interval_seconds = _analytics_interval_seconds(len(rows))
     for row in rows:
         group_id = row.get("group_id")
         row["group_deleted"] = bool(group_id) and not (groups_directory / (group_id + ".sqlite3")).is_file()
-        item = by_tool.setdefault(row["tool_name"], {"count": 0, "errors": 0})
-        item["count"] += 1
-        item["errors"] += row["outcome"] == "error"
-        caller = str(row.get("name") or "Unknown caller")
-        by_caller[caller] = by_caller.get(caller, 0) + 1
-        bucket = _analytics_bucket(row["occurred_at"], interval_seconds)
-        by_time[bucket] = by_time.get(bucket, 0) + 1
-        outcome_label = "Success" if row["outcome"] == "success" else format_error_category(row.get("error_category"))
-        by_outcome[outcome_label] = by_outcome.get(outcome_label, 0) + 1
-    return {"available": True, "rows": rows, "by_tool": by_tool, "by_caller": by_caller, "by_time": by_time, "by_outcome": by_outcome, "durations": [row["duration_ms"] for row in rows], "interval_seconds": interval_seconds}
+    for tool_name, name, outcome, error_category, bucket, count, errors in aggregate:
+        bucket_key = datetime.fromtimestamp(bucket, timezone.utc).isoformat()
+        item = by_tool.setdefault(tool_name, {"count": 0, "errors": 0}); item["count"] += count; item["errors"] += errors
+        by_caller[name or "Unknown caller"] = by_caller.get(name or "Unknown caller", 0) + count
+        by_time[bucket_key] = by_time.get(bucket_key, 0) + count
+        label = "Success" if outcome == "success" else format_error_category(error_category)
+        by_outcome[label] = by_outcome.get(label, 0) + count
+    return {"available": True, "rows": rows, "by_tool": by_tool, "by_caller": by_caller, "by_time": by_time, "by_outcome": by_outcome, "latency_histogram": histogram, "interval_seconds": interval_seconds}
 
 
 def _percentile(values: List[int], percentile: float) -> Optional[int]:
@@ -1269,7 +1613,7 @@ def render_tool_analytics(groups_directory: Optional[Path], filters: Optional[di
     form = '<form hx-get="/fragments/analytics" hx-target="#chat-panel" hx-swap="innerHTML"><header class="view-header"><div><h2>Tool analytics</h2><p>Tool volume, reliability, and latency from audit history.</p></div></header><div class="filters">{}</div></form>'.format(fields)
     if not data["available"]:
         return '<section class="view analytics" data-analytics="true" data-page-title="Tool analytics" data-page-description="Tool volume, reliability, and latency from audit history.">{}<p class="notice error">Audit data is unavailable. Enable auditing to begin collecting tool analytics.</p></section>'.format(form)
-    p50, p95 = _percentile(data["durations"], .50), _percentile(data["durations"], .95)
+    p50, p95 = _histogram_percentile(data["latency_histogram"], .50), _histogram_percentile(data["latency_histogram"], .95)
     errors = sum(1 for row in data["rows"] if row["outcome"] == "error")
     error_rate = "{:.1f}%".format(errors * 100 / len(data["rows"])) if data["rows"] else "0.0%"
     metrics = '<div class="metrics"><article class="metric"><strong>Total calls</strong><span>{}</span></article><article class="metric"><strong>p50 / p95 latency</strong><span>{} / {} ms</span></article><article class="metric{}"><strong>Error rate</strong><span>{}</span></article></div>'.format(len(data["rows"]), p50 if p50 is not None else "—", p95 if p95 is not None else "—", " is-alert" if errors else "", error_rate)
@@ -1361,6 +1705,9 @@ def delete_audit_history(groups_directory: Optional[Path]) -> dict:
             # when the corresponding group database is deleted.
             connection.execute("DELETE FROM tool_call_group_names")
             deleted = connection.execute("DELETE FROM tool_calls").rowcount
+            for resolution, _ in ANALYTICS_ROLLUPS:
+                connection.execute("DELETE FROM analytics_" + resolution)
+                connection.execute("DELETE FROM analytics_latency_" + resolution)
             connection.commit()
         finally:
             connection.close()
@@ -1386,9 +1733,10 @@ def render_storage(groups_directory: Optional[Path], csrf_token: Optional[str] =
 
 def _legacy_render_dashboard(groups_directory: Optional[Path], csrf_token: Optional[str] = None) -> str:
     groups = discover_groups(groups_directory) if groups_directory is not None else []
+    group_names = group_catalog_names(groups_directory)
     selected = groups[0] if groups else None
     picker = "".join(
-        '<button hx-get="/fragments/chat?group_id={id}" hx-target="#chat-panel" hx-swap="innerHTML" data-group-id="{id}" title="{id}">{name}</button>'.format(id=html.escape(group_id), name=html.escape(group_display_name(groups_directory, group_id)))
+        '<button hx-get="/fragments/chat?group_id={id}" hx-target="#chat-panel" hx-swap="innerHTML" data-group-id="{id}" title="{id}">{name}</button>'.format(id=html.escape(group_id), name=html.escape(group_names.get(group_id) or group_display_name(groups_directory, group_id)))
         for group_id in groups
     ) or '<p class="notice">No groups found. This page will update when a group database appears.</p>'
     return """<!doctype html>
@@ -1430,6 +1778,22 @@ def _sidebar_render_dashboard(groups_directory: Optional[Path], csrf_token: Opti
 def render_dashboard(groups_directory: Optional[Path], csrf_token: Optional[str] = None) -> str:
     """Render the dense operations shell shared by Overview, Chats, and Analytics."""
     page = _sidebar_render_dashboard(groups_directory, csrf_token)
+    page = page.replace(
+        "function charts(){",
+        "var overviewReconcileTimer;function refreshOverviewGroup(group){var panel=document.getElementById('chat-panel');if(!panel||!panel.querySelector('[data-overview]'))return;var row=panel.querySelector('[data-overview-group-id=\\\"'+group+'\\\"]');if(!row)return replaceIf('[data-overview]','/fragments/overview');fetch('/fragments/overview-group-row?group_id='+encodeURIComponent(group)).then(function(response){return response.text()}).then(function(html){if(html)row.outerHTML=html;else replaceIf('[data-overview]','/fragments/overview')});clearTimeout(overviewReconcileTimer);overviewReconcileTimer=setTimeout(function(){replaceIf('[data-overview]','/fragments/overview')},5000)}function charts(){",
+    )
+    page = page.replace(
+        "document.getElementById('activity-indicator').textContent='New activity';return replaceIf('[data-overview]','/fragments/overview')",
+        "document.getElementById('activity-indicator').textContent='New activity';refreshOverviewGroup(d.group_id);return",
+    )
+    page = page.replace(
+        "refreshOpenChat(d.group_id);replaceIf('[data-overview]','/fragments/overview')",
+        "refreshOpenChat(d.group_id);refreshOverviewGroup(d.group_id)",
+    )
+    page = page.replace(
+        "source.addEventListener('member.changed',function(){replaceIf('[data-overview]','/fragments/overview')});source.addEventListener('wakeup.changed',function(){replaceIf('[data-overview]','/fragments/overview')})",
+        "source.addEventListener('member.changed',function(e){refreshOverviewGroup(JSON.parse(e.data).group_id)});source.addEventListener('wakeup.changed',function(e){refreshOverviewGroup(JSON.parse(e.data).group_id)})",
+    )
     fallback = """<script>(function(){function swap(target,html){var node=document.querySelector(target||'#chat-panel');if(node)node.innerHTML=html}function request(url,options,target){fetch(url,Object.assign({credentials:'same-origin'},options||{})).then(function(response){return response.text()}).then(function(html){swap(target,html)}).catch(function(){swap(target,'<p class="notice error">The local observer request could not be completed. Retry shortly.</p>')})}document.addEventListener('click',function(event){var step=event.target.closest('[data-range-step]');if(step){event.preventDefault();var range=step.closest('.range-composite'),input=range&&range.querySelector('[name=range_unit]'),label=range&&range.querySelector('[data-range-unit]'),units=['s','m','h','d','M','Y'],names={s:'seconds',m:'minutes',h:'hours',d:'days',M:'months',Y:'years'};if(!input||!label)return;var index=units.indexOf(input.value);index=(index<0?2:index)+Number(step.dataset.rangeStep);index=(index+units.length)%units.length;input.value=units[index];label.textContent=names[units[index]];return}var control=event.target.closest('[hx-get],[hx-post]');if(!control||control.tagName==='FORM')return;event.preventDefault();if(control.dataset.view){document.querySelectorAll('[data-view]').forEach(function(item){item.classList.toggle('is-active',item.dataset.view===control.dataset.view)})}if(control.hasAttribute('hx-get')){request(control.getAttribute('hx-get'),null,control.getAttribute('hx-target'));return}if(control.hasAttribute('hx-confirm')&&!window.confirm(control.getAttribute('hx-confirm')))return;var headers={};try{headers=JSON.parse(control.getAttribute('hx-headers')||'{}')}catch(error){}request(control.getAttribute('hx-post'),{method:'POST',headers:headers},control.getAttribute('hx-target'))});document.addEventListener('submit',function(event){var form=event.target.closest('form[hx-get]');if(!form)return;event.preventDefault();var query=new URLSearchParams(new FormData(form));request(form.getAttribute('hx-get')+'?'+query.toString(),null,form.getAttribute('hx-target'))})();</script>"""
     fallback = fallback.replace("form.getAttribute('hx-target'))})();</script>", "form.getAttribute('hx-target'))});})();</script>")
     fallback += """<script>(function(){var timer;function analyticsForm(node){var form=node&&node.closest('form[hx-get]');return form&&form.closest('[data-analytics]')?form:null}function apply(form){var query=new URLSearchParams(new FormData(form)),target=document.querySelector(form.getAttribute('hx-target')||'#chat-panel');fetch(form.getAttribute('hx-get')+'?'+query.toString(),{credentials:'same-origin'}).then(function(response){return response.text()}).then(function(html){if(target)target.innerHTML=html})}document.addEventListener('change',function(event){var form=analyticsForm(event.target);if(form)apply(form)});document.addEventListener('input',function(event){if(event.target.name!=='range_value')return;var form=analyticsForm(event.target);if(!form)return;clearTimeout(timer);timer=setTimeout(function(){apply(form)},300)});document.addEventListener('click',function(event){if(!event.target.closest('[data-range-step]'))return;var form=analyticsForm(event.target);if(form)setTimeout(function(){apply(form)},0)})})();</script>"""
@@ -1459,6 +1823,7 @@ def render_dashboard(groups_directory: Optional[Path], csrf_token: Optional[str]
     }
     for glyph, icon in icons.items():
         page = page.replace('<span class="nav-icon">' + glyph + '</span>', '<span class="nav-icon">' + icon + '</span>')
+    page = page.replace("</head>", '<script src="/static/observer-live.js"></script></head>')
     return page.replace("</body>", '<!-- legacy crosstalk-theme\')||\'dark\' preference marker --><button id="theme-toggle" hidden aria-hidden="true" tabindex="-1"><span></span></button>' + fallback + "</body>")
 
 

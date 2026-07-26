@@ -45,11 +45,52 @@ class CrosstalkStoreTests(unittest.TestCase):
         after = self.store.get_messages_after(self.group_id, "reader-1", "reader", 1)
         self.assertEqual([message["id"] for message in after], [2])
 
+    def test_get_all_messages_handles_more_than_sqlite_bind_limit(self):
+        """Full-history reads keep their contract without constructing a huge IN clause."""
+        database = self.groups_directory / (self.group_id + ".sqlite3")
+        connection = main.sqlite3.connect(str(database))
+        try:
+            connection.executemany(
+                "INSERT INTO messages(sender_context_id, sender_name, content, created_at) VALUES (?, ?, ?, ?)",
+                [("developer-1", "developer", "message " + str(index), "2026-01-01T00:00:00+00:00") for index in range(1000)],
+            )
+            connection.executemany(
+                "INSERT INTO member_unread_messages(context_id, message_id) VALUES (?, ?)",
+                [("reader-1", index) for index in range(1, 1001)],
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        messages = self.store.get_all_messages(self.group_id, "reader-1", "reader")
+
+        self.assertEqual(len(messages), 1000)
+        self.assertEqual(self.store.get_unread_messages(self.group_id, "reader-1", "reader"), [])
+
     def test_search_supports_sql_like_wildcards(self):
         self.store.send_message(self.group_id, "developer-1", "developer", "cache eviction")
         self.store.send_message(self.group_id, "architect-1", "architect", "cache design")
         matches = self.store.search_messages(self.group_id, "searcher-1", "researcher", "cache %")
         self.assertEqual([message["id"] for message in matches], [1, 2])
+
+    def test_search_uses_like_compatible_trigram_index(self):
+        self.store.send_message(self.group_id, "developer-1", "developer", "Cache-1 is ready")
+        self.store.send_message(self.group_id, "architect-1", "architect", "Cache-2 needs review")
+
+        matches = self.store.search_messages(self.group_id, "searcher-1", "researcher", "cache-_")
+
+        self.assertEqual([message["id"] for message in matches], [1, 2])
+        database = self.groups_directory / (self.group_id + ".sqlite3")
+        connection = main.sqlite3.connect(str(database))
+        try:
+            self.assertIsNotNone(connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'message_search'"
+            ).fetchone())
+            self.assertIn("detail='none'", connection.execute(
+                "SELECT sql FROM sqlite_master WHERE name = 'message_search'"
+            ).fetchone()[0])
+        finally:
+            connection.close()
 
     def test_sender_messages_are_not_unread_for_the_sender(self):
         self.store.send_message(self.group_id, "developer-1", "developer", "My message")
@@ -57,6 +98,27 @@ class CrosstalkStoreTests(unittest.TestCase):
         self.store.send_message(self.group_id, "architect-1", "architect", "A reply")
         unread = self.store.get_unread_messages(self.group_id, "developer-1", "developer")
         self.assertEqual([message["message"] for message in unread], ["A reply"])
+
+    def test_member_unread_counters_follow_send_and_read_state(self):
+        self.store.send_message(self.group_id, "developer-1", "developer", "A message")
+        database = self.groups_directory / (self.group_id + ".sqlite3")
+        connection = main.sqlite3.connect(str(database))
+        try:
+            self.assertEqual(connection.execute(
+                "SELECT unread_count FROM group_members WHERE context_id = 'reader-1'"
+            ).fetchone()[0], 1)
+        finally:
+            connection.close()
+
+        self.store.get_unread_messages(self.group_id, "reader-1", "reader")
+
+        connection = main.sqlite3.connect(str(database))
+        try:
+            self.assertEqual(connection.execute(
+                "SELECT unread_count FROM group_members WHERE context_id = 'reader-1'"
+            ).fetchone()[0], 0)
+        finally:
+            connection.close()
 
     def test_tool_call_example_collaboration_flow(self):
         monitor = main.GroupSubscriptionMonitor(self.store, 0.1)
@@ -94,6 +156,11 @@ class CrosstalkStoreTests(unittest.TestCase):
         self.assertFalse((self.groups_directory / (self.group_id + ".sqlite3")).exists())
         self.assertTrue((self.groups_directory / (other_group + ".sqlite3")).exists())
 
+    def test_list_groups_reads_known_metadata_from_the_catalog(self):
+        with patch.object(self.store, "get_group_metadata", side_effect=AssertionError("catalogged groups must not be reopened")):
+            groups = self.store.list_groups()
+        self.assertEqual((len(groups), groups[0]["group_id"], groups[0]["name"], groups[0]["description"]), (1, self.group_id, "", ""))
+
     def test_only_creator_can_delete_group(self):
         with self.assertRaisesRegex(main.AuthorizationError, "created this group"):
             self.store.delete_group(self.group_id, "architect-1")
@@ -111,6 +178,17 @@ class CrosstalkStoreTests(unittest.TestCase):
         self.store.send_message(self.group_id, "developer-1", "developer", "A message")
         self.assertEqual(self.store.group_update_snapshot(self.group_id)["latest_message_id"], 1)
 
+    def test_group_subscription_tracks_message_revision_without_snapshot_scan(self):
+        uri = main.GroupSubscriptionMonitor.uri_for_group(self.group_id)
+        monitor = main.GroupSubscriptionMonitor(self.store, 1)
+        try:
+            with patch.object(self.store, "group_update_snapshot", side_effect=AssertionError("polling must not read message counts")):
+                monitor.subscribe(uri)
+            with monitor._lock:
+                self.assertEqual(monitor._subscriptions[uri]["message_revision"], 0)
+        finally:
+            monitor.stop()
+
     def test_current_schema_version_is_recorded(self):
         database = self.groups_directory / (self.group_id + ".sqlite3")
         connection = main.sqlite3.connect(str(database))
@@ -118,6 +196,31 @@ class CrosstalkStoreTests(unittest.TestCase):
             self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], main.GROUP_SCHEMA_VERSION)
         finally:
             connection.close()
+
+    def test_group_state_revisions_track_observer_relevant_changes(self):
+        database = self.groups_directory / (self.group_id + ".sqlite3")
+
+        def revisions():
+            connection = main.sqlite3.connect(str(database))
+            try:
+                return connection.execute(
+                    "SELECT message_revision, member_revision, wakeup_revision, metadata_revision "
+                    "FROM group_state WHERE id = 1"
+                ).fetchone()
+            finally:
+                connection.close()
+
+        before = revisions()
+        self.store.update_group_metadata(self.group_id, "developer-1", name="Renamed")
+        self.assertEqual(revisions(), (before[0], before[1], before[2], before[3] + 1))
+
+        self.store.send_message(self.group_id, "developer-1", "developer", "Please review")
+        sent = revisions()
+        self.assertEqual(sent, (before[0] + 1, before[1] + 1, before[2] + 1, before[3] + 1))
+
+        self.store.get_unread_messages(self.group_id, "architect-1", "architect")
+        acknowledged = revisions()
+        self.assertEqual(acknowledged, (sent[0], sent[1] + 1, sent[2] + 1, sent[3]))
 
     def test_subscription_poll_interval_is_configurable(self):
         monitor = main.GroupSubscriptionMonitor(self.store, 0.1)
@@ -183,7 +286,7 @@ class CrosstalkStoreTests(unittest.TestCase):
             columns = {row[1] for row in connection.execute("PRAGMA table_info(tool_calls)")}
             self.assertEqual(columns, {"id", "occurred_at", "audit_request_id", "tool_name", "group_id", "context_id", "name", "outcome", "duration_ms", "result_count", "error_category", "details_json"})
             indexes = {row[1] for row in connection.execute("PRAGMA index_list(tool_calls)")}
-            self.assertEqual(indexes, {"tool_calls_by_occurred_at", "tool_calls_by_tool_and_occurred_at", "tool_calls_by_group_and_occurred_at", "tool_calls_by_context_and_occurred_at", "tool_calls_by_outcome_and_occurred_at"})
+            self.assertEqual(indexes, {"tool_calls_by_occurred_at", "tool_calls_by_tool_and_occurred_at", "tool_calls_by_group_and_occurred_at", "tool_calls_by_context_and_occurred_at", "tool_calls_by_name_and_occurred_at", "tool_calls_by_outcome_and_occurred_at"})
         finally:
             connection.close()
         group_connection = main.sqlite3.connect(str(group_database))
@@ -191,6 +294,29 @@ class CrosstalkStoreTests(unittest.TestCase):
             self.assertEqual(group_connection.execute("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").fetchall(), group_tables_before)
         finally:
             group_connection.close()
+
+    def test_observability_store_migrates_a_legacy_database_and_backfills_rollups(self):
+        database_path = self.groups_directory / "observability.sqlite3"
+        connection = main.sqlite3.connect(str(database_path))
+        try:
+            connection.executescript("""
+                CREATE TABLE metadata (id INTEGER PRIMARY KEY, schema_version INTEGER NOT NULL, created_at TEXT NOT NULL, audit_enabled_at TEXT NOT NULL, last_retention_cleanup_at TEXT, retention_setting TEXT);
+                CREATE TABLE tool_calls (id INTEGER PRIMARY KEY, occurred_at TEXT NOT NULL, audit_request_id TEXT, tool_name TEXT NOT NULL, group_id TEXT, context_id TEXT, name TEXT, outcome TEXT NOT NULL, duration_ms INTEGER NOT NULL, result_count INTEGER, error_category TEXT, details_json TEXT);
+            """)
+            connection.execute("INSERT INTO metadata VALUES (1, 1, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00', NULL, 'inf')")
+            connection.execute("INSERT INTO tool_calls(occurred_at, tool_name, outcome, duration_ms) VALUES ('2026-01-01T00:00:00+00:00', 'list_groups', 'error', 17)")
+            connection.commit()
+        finally:
+            connection.close()
+
+        main.ObservabilityStore(str(self.groups_directory)).initialize()
+
+        connection = main.sqlite3.connect(str(database_path))
+        try:
+            self.assertEqual(connection.execute("SELECT SUM(call_count), SUM(error_count) FROM analytics_30d").fetchone(), (1, 1))
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], main.OBSERVABILITY_SCHEMA_VERSION)
+        finally:
+            connection.close()
 
     def test_audit_identity_does_not_confuse_metadata_with_caller_name(self):
         self.assertEqual(main.audit_identity("create_group", {"context_id": "creator", "name": "Group title"}, {"group_id": self.group_id}), {"group_id": self.group_id, "context_id": "creator", "name": None})
@@ -236,16 +362,8 @@ class CrosstalkStoreTests(unittest.TestCase):
 
     def test_retention_cleanup_is_bounded_and_skips_unlimited_retention(self):
         audit_store = main.ObservabilityStore(str(self.groups_directory))
-        audit_store.initialize()
-        database = main.sqlite3.connect(str(audit_store.database_path))
-        try:
-            database.execute("INSERT INTO tool_calls(occurred_at, tool_name, outcome, duration_ms) VALUES (?, 'list_groups', 'success', 1)", ((main.datetime.now(main.timezone.utc) - main.timedelta(days=2)).isoformat(),))
-            database.execute("INSERT INTO tool_calls(occurred_at, tool_name, outcome, duration_ms) VALUES (?, 'list_groups', 'success', 1)", (main.datetime.now(main.timezone.utc).isoformat(),))
-            database.execute("INSERT INTO tool_call_group_names(tool_call_id, group_name) VALUES (1, 'Expired group')")
-            database.execute("INSERT INTO tool_call_group_names(tool_call_id, group_name) VALUES (2, 'Current group')")
-            database.commit()
-        finally:
-            database.close()
+        audit_store.record_event(main.AuditEvent((main.datetime.now(main.timezone.utc) - main.timedelta(days=2)).isoformat(), None, "list_groups", None, None, None, "success", 1, None, None, None, "Expired group"))
+        audit_store.record_event(main.AuditEvent(main.datetime.now(main.timezone.utc).isoformat(), None, "list_groups", None, None, None, "success", 1, None, None, None, "Current group"))
         self.assertEqual(audit_store.cleanup_retention(None), 0)
         self.assertEqual(audit_store.cleanup_retention(1), 1)
         self.assertEqual(audit_store.cleanup_retention(1), 0)
@@ -254,6 +372,20 @@ class CrosstalkStoreTests(unittest.TestCase):
             self.assertEqual(database.execute("SELECT tool_call_id, group_name FROM tool_call_group_names ORDER BY tool_call_id").fetchall(), [(2, "Current group")])
         finally:
             database.close()
+
+    def test_audit_writes_maintain_filter_values(self):
+        audit_store = main.ObservabilityStore(str(self.groups_directory))
+        audit_store.record_event(main.AuditEvent("2026-01-01T12:00:00+00:00", "1", "send_message", self.group_id, "writer", "Writer", "success", 1, None, None, None, "Project launch"))
+        database = main.sqlite3.connect(str(audit_store.database_path))
+        try:
+            values = set(database.execute("SELECT field, value, label, count FROM analytics_filter_values"))
+        finally:
+            database.close()
+        self.assertEqual(values, {
+            ("tool_name", "send_message", "send_message", 1),
+            ("name", "Writer", "Writer", 1),
+            ("group_id", self.group_id, "Project launch", 1),
+        })
 
     def test_enabled_auditing_records_each_completed_tool_call_not_protocol_requests(self):
         monitor = main.GroupSubscriptionMonitor(self.store, 0.1)
@@ -645,7 +777,7 @@ class CrosstalkStoreTests(unittest.TestCase):
         monitor = main.GroupSubscriptionMonitor(self.store, 0.01)
         try:
             monitor.subscribe(uri)
-            with patch.object(self.store, "group_update_snapshot", side_effect=main.sqlite3.OperationalError("database is locked")):
+            with patch.object(self.store, "group_message_revision", side_effect=main.sqlite3.OperationalError("database is locked")):
                 time.sleep(0.05)
             with monitor._lock:
                 self.assertIn(uri, monitor._subscriptions)
@@ -692,7 +824,7 @@ class CrosstalkStoreTests(unittest.TestCase):
             with patch.object(main, "notify", side_effect=OSError("stdout unavailable")):
                 time.sleep(0.05)
             with monitor._lock:
-                self.assertEqual(monitor._subscriptions[uri]["latest_id"], 0)
+                self.assertEqual(monitor._subscriptions[uri]["message_revision"], 0)
             notifications = []
             with patch.object(main, "notify", side_effect=lambda method, params: notifications.append((method, params))):
                 deadline = time.monotonic() + 1
@@ -700,7 +832,7 @@ class CrosstalkStoreTests(unittest.TestCase):
                     time.sleep(0.01)
             self.assertEqual(notifications[0][1]["relevance"], "group_change")
             with monitor._lock:
-                self.assertEqual(monitor._subscriptions[uri]["latest_id"], 1)
+                self.assertEqual(monitor._subscriptions[uri]["message_revision"], 1)
         finally:
             monitor.stop()
 
