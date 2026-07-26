@@ -1348,6 +1348,10 @@ def delete_audit_history(groups_directory: Optional[Path]) -> dict:
         connection = sqlite3.connect(str(path), timeout=0.1)
         try:
             connection.execute("PRAGMA busy_timeout=100")
+            # Group-name snapshots are part of each audit event.  They must be
+            # removed only when audit history itself is explicitly purged, never
+            # when the corresponding group database is deleted.
+            connection.execute("DELETE FROM tool_call_group_names")
             deleted = connection.execute("DELETE FROM tool_calls").rowcount
             connection.commit()
         finally:

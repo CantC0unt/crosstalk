@@ -284,10 +284,19 @@ class ObservabilityStore:
                 if now - last_cleanup < timedelta(days=1):
                     return 0
             cutoff = (now - timedelta(days=retention_days)).isoformat()
-            cursor = database.execute("DELETE FROM tool_calls WHERE id IN (SELECT id FROM tool_calls WHERE occurred_at < ? ORDER BY occurred_at LIMIT ?)", (cutoff, RETENTION_CLEANUP_BATCH_SIZE))
+            expired_ids = [row[0] for row in database.execute(
+                "SELECT id FROM tool_calls WHERE occurred_at < ? ORDER BY occurred_at LIMIT ?",
+                (cutoff, RETENTION_CLEANUP_BATCH_SIZE),
+            )]
+            if expired_ids:
+                placeholders = ",".join("?" for _ in expired_ids)
+                database.execute("DELETE FROM tool_call_group_names WHERE tool_call_id IN (" + placeholders + ")", expired_ids)
+                cursor = database.execute("DELETE FROM tool_calls WHERE id IN (" + placeholders + ")", expired_ids)
+            else:
+                cursor = None
             database.execute("UPDATE metadata SET last_retention_cleanup_at = ? WHERE id = 1", (now.isoformat(),))
             database.commit()
-            return cursor.rowcount
+            return cursor.rowcount if cursor is not None else 0
         finally:
             database.close()
 
@@ -1214,11 +1223,21 @@ def _handle_request(request: Any, store: CrosstalkStore, subscriptions: GroupSub
             arguments = params.get("arguments", {})
             started_at = datetime.now(timezone.utc).isoformat()
             started_monotonic = time.monotonic()
-            result = call_tool(store, tool_name, arguments, subscriptions)
+            invalid_arguments = not isinstance(arguments, dict)
+            if invalid_arguments:
+                result = tool_result(
+                    {"error": "tools/call arguments must be an object."},
+                    True,
+                    ValidationError.audit_category,
+                )
+            else:
+                result = call_tool(store, tool_name, arguments, subscriptions)
             audit_configuration = observability_configuration()
             if audit_configuration.enabled:
                 event = audit_tool_result(tool_name, arguments, result, request_id, started_at, started_monotonic)
                 attempt_audit_write(store, event, audit_configuration.retention_days)
+            if invalid_arguments:
+                return _error_response(request_id, -32602, "Invalid params: tools/call arguments must be an object.")
         elif method == "resources/list":
             result = {"resources": [{"uri": GroupSubscriptionMonitor.uri_for_group(group["group_id"]), "name": "Crosstalk " + group["group_id"], "description": "Group-change signal. A change may not be relevant to this AI; call get_unread_messages to check.", "mimeType": "application/json"} for group in store.list_groups()]}
         elif method == "resources/read":
