@@ -949,7 +949,7 @@ class GroupSubscriptionMonitor:
         group_id, context_id = remainder.split(cls.WAKEUP_SEGMENT, 1)
         CrosstalkStore._validate_group_id(group_id)
         context_id = unquote(context_id)
-        if not context_id.strip() or "/" in context_id:
+        if not context_id.strip():
             raise ValueError("Invalid wakeup context ID.")
         return {"group_id": group_id, "context_id": context_id}
 
@@ -1039,7 +1039,7 @@ class GroupSubscriptionMonitor:
 
 IDENTITY_PROPERTIES = {
     "group_id": {"type": "string", "description": "The target Crosstalk group ID."},
-    "context_id": {"type": "string", "description": "Stable, unique identifier for the calling AI context/session."},
+    "context_id": {"type": "string", "description": "Stable, unique identifier for the calling AI context/session. Use your actual resumable context ID verbatim; for example, Codex exposes this in CODEX_THREAD_ID. Never invent an ID."},
     "name": {"type": "string", "description": "Human-readable caller label or role, used for logging (for example, 'architect')."},
 }
 AUDIT_CALLER_NAME_PROPERTY = {
