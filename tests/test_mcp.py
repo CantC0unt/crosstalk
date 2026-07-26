@@ -572,6 +572,28 @@ class CrosstalkStoreTests(unittest.TestCase):
         finally:
             monitor.stop()
 
+    def test_join_supports_a_context_id_with_a_slash(self):
+        context_id = "/root"
+        uri = main.GroupSubscriptionMonitor.wakeup_uri_for_group(self.group_id, context_id)
+        monitor = main.GroupSubscriptionMonitor(self.store, 0.1)
+        try:
+            joined = main.call_tool(self.store, "join_group", {
+                "group_id": self.group_id, "context_id": context_id, "name": "Frrank",
+            }, monitor)
+            self.assertFalse(joined["isError"])
+            self.assertEqual(json.loads(joined["content"][0]["text"])["wakeup_resource_uri"], uri)
+            self.assertTrue(monitor.is_wakeup_authorized(uri))
+            self.assertEqual(
+                main.GroupSubscriptionMonitor.wakeup_from_uri(uri),
+                {"group_id": self.group_id, "context_id": context_id},
+            )
+            self.assertEqual(
+                [user["context_id"] for user in self.store.get_users(self.group_id) if user["context_id"] == context_id],
+                [context_id],
+            )
+        finally:
+            monitor.stop()
+
     def test_leaving_group_stops_wakeup_delivery(self):
         notifications = []
         uri = main.GroupSubscriptionMonitor.wakeup_uri_for_group(self.group_id, "architect-1")
