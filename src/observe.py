@@ -471,12 +471,20 @@ class EventHub:
         with self._lock:
             if self._closed:
                 return
-            subscribers = list(self.subscribers)
-        for subscriber in subscribers:
-            try:
-                subscriber.put_nowait((event, payload))
-            except queue.Full:
-                self.unsubscribe(subscriber)
+            for subscriber in list(self.subscribers):
+                try:
+                    subscriber.put_nowait((event, payload))
+                except queue.Full:
+                    # Live events are refresh hints, not a durable event log. A
+                    # backpressured browser must reconnect and receive a fresh
+                    # snapshot, rather than retaining a request thread forever.
+                    self.subscribers.remove(subscriber)
+                    while True:
+                        try:
+                            subscriber.get_nowait()
+                        except queue.Empty:
+                            break
+                    subscriber.put_nowait(None)
 
     def close(self) -> None:
         """Wake SSE handlers so server shutdown does not wait for browsers."""

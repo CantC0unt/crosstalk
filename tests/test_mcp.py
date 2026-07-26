@@ -311,6 +311,36 @@ class CrosstalkStoreTests(unittest.TestCase):
         finally:
             monitor.stop()
 
+    def test_auditing_preserves_deleted_group_name_snapshot(self):
+        self.store.update_group_metadata(self.group_id, "developer-1", name="Release coordination")
+        monitor = main.GroupSubscriptionMonitor(self.store, 0.1)
+        try:
+            state = {"initialized": True, "client_ready": True}
+            request = {
+                "jsonrpc": "2.0", "id": 8, "method": "tools/call",
+                "params": {"name": "delete_group", "arguments": {
+                    "group_id": self.group_id, "context_id": "developer-1",
+                }},
+            }
+            with patch.dict("os.environ", {"CROSSTALK_OBSERVABILITY_RETENTION_DAYS": "inf"}, clear=True):
+                response = main._handle_request(request, self.store, monitor, state)
+            self.assertFalse(response["result"]["isError"])
+            self.assertFalse((self.groups_directory / (self.group_id + ".sqlite3")).exists())
+            audit = main.sqlite3.connect(str(self.groups_directory / "observability.sqlite3"))
+            try:
+                self.assertEqual(
+                    audit.execute(
+                        "SELECT group_name FROM tool_call_group_names "
+                        "JOIN tool_calls ON tool_calls.id = tool_call_group_names.tool_call_id "
+                        "WHERE tool_calls.tool_name = 'delete_group'"
+                    ).fetchone()[0],
+                    "Release coordination",
+                )
+            finally:
+                audit.close()
+        finally:
+            monitor.stop()
+
     def test_subscription_poll_interval_rejects_nonfinite_values(self):
         for value in (float("nan"), float("inf"), float("-inf")):
             with self.assertRaisesRegex(ValueError, "finite"):
