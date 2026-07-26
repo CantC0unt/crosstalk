@@ -20,6 +20,18 @@ class MainCommandTests(unittest.TestCase):
             self.assertEqual(main.serve(["observe", *arguments]), 0)
         observer_serve.assert_called_once_with(arguments)
 
+    def test_help_and_version_do_not_start_a_server(self):
+        with patch("sys.stdout") as stdout, patch.object(main.mcp, "serve") as mcp_serve:
+            self.assertEqual(main.serve(["--help"]), 0)
+            self.assertEqual(main.serve(["--version"]), 0)
+        mcp_serve.assert_not_called()
+        self.assertEqual(stdout.write.call_args_list[0].args[0], main.USAGE)
+        self.assertEqual(stdout.write.call_args_list[1].args[0], main.mcp.SERVER_VERSION + "\n")
+        self.assertIn("--silent", main.USAGE)
+        self.assertIn("--port PORT", main.USAGE)
+        self.assertIn("--poll-interval SECONDS", main.USAGE)
+        self.assertIn("--groups-dir PATH", main.USAGE)
+
     def test_unknown_command_returns_an_error(self):
         with patch("sys.stderr") as stderr:
             self.assertEqual(main.serve(["unknown"]), 2)
