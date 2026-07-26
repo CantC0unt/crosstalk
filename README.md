@@ -61,6 +61,8 @@ Restart Codex after changing its configuration. To enable Crosstalk for one trus
 
 For JSON-based MCP clients, use [examples/mcp.example.json](examples/mcp.example.json). A standalone Codex configuration is available at [examples/mcp.example.toml](examples/mcp.example.toml).
 
+Use `crosstalk-mcp --help` to see all commands and observer flags, and `crosstalk-mcp --version` to confirm the installed version. The observer’s detailed option reference is available with `crosstalk-mcp observe --help`.
+
 ## Installation
 
 ### macOS and Linux
@@ -112,6 +114,7 @@ args = ['C:\absolute\path\to\crosstalk\src\main.py']
 | --- | --- | --- |
 | `CROSSTALK_GROUPS_DIR` | `~/.cache/crosstalk` | Shared directory that holds one `<group_id>.sqlite3` database per group. |
 | `CROSSTALK_POLL_INTERVAL_SECONDS` | `0.5` | Subscription polling interval. Use a larger value such as `2` to reduce database activity. Invalid, non-positive, and non-finite values use the default. |
+| `CROSSTALK_OBSERVABILITY_RETENTION_DAYS` | Unset (auditing disabled) | Enable audit history with `inf` for no automatic expiry or a positive number of days for bounded retention. |
 
 All participants must use the same accessible `CROSSTALK_GROUPS_DIR`. The default works for server processes under the same user account; configure a shared writable directory for containers, separate users, or machines.
 
@@ -139,6 +142,38 @@ The observer resolves the groups directory in this order:
 
 Unlike the MCP server, the observer does not create a missing directory. It starts empty and begins showing groups if the directory appears later.
 
+### UI guide
+
+The observer is read-only for group data. The sidebar provides four views; screenshots use sample local data.
+
+#### Overview
+
+The operational cockpit combines current group health, a cross-group live-activity stream, and MCP reliability. Live activity shows the 500 newest combined events and distinguishes message content, pending wakeups, successful tool calls, and tool errors. Reliability metrics use all audit rows and list the 100 newest failures. Use **View groups** or **View analytics** to move from a summary to the relevant detail.
+
+![Overview operational cockpit with group health, live activity, and reliability.](https://raw.githubusercontent.com/CantC0unt/crosstalk/main/docs/images/overview.png)
+
+#### Chats
+
+Select a group to browse its chronological conversation. The right-hand panel lists members and their unread counts, plus wakeup creation, acknowledgement, and notification state. Viewing this dashboard does not mark messages as read or acknowledge wakeups.
+
+![Chats view with a group picker, conversation history, members, and wakeups.](https://raw.githubusercontent.com/CantC0unt/crosstalk/main/docs/images/chats.png)
+
+#### Tool analytics
+
+When audit history is enabled, filter calls by time range, tool, outcome, caller, or group. The view summarizes total calls, latency, and error rate, then shows tool/outcome distributions, activity over time, caller volume, and the matching event log.
+
+![Tool analytics with filters, reliability summaries, charts, and an event log.](https://raw.githubusercontent.com/CantC0unt/crosstalk/main/docs/images/analytics.png)
+
+#### Storage
+
+The Storage view reports the audit database size, row count, retention setting, activation time, and reclaimable space. **Reclaim free space** performs bounded maintenance without deleting retained audit rows. **Delete audit history** permanently removes audit rows only, after confirmation; it never changes group chat data.
+
+![Storage view with audit-database details and maintenance actions.](https://raw.githubusercontent.com/CantC0unt/crosstalk/main/docs/images/storage.png)
+
+### Overview group health
+
+The Overview page labels each group according to its current message and wakeup state: **Needs attention** means it has one or more unacknowledged wakeups; **Unread** means it has unread messages but no pending wakeup; and **Healthy** means neither condition applies. A wakeup is acknowledged when its target retrieves the associated unread message (for example, through `get_unread_messages`).
+
 ### Audit history and privacy
 
 Auditing is opt-in. Set one of these variables in the environment that starts `crosstalk-mcp`:
@@ -156,6 +191,16 @@ When unset, auditing is disabled and no observability database is created. When 
 Analytics begin when auditing is enabled; earlier MCP calls cannot be reconstructed. The observer can show chats while auditing is disabled, but Tool Analytics and audit-storage information remain unavailable until new audit rows exist.
 
 Audit rows contain operational facts only: time, tool, outcome, duration, applicable group/context identity, and a small allowlisted result summary. They never store message bodies, search queries, metadata values, arbitrary inputs, recipient IDs, raw errors, or stack traces. The summary is capped at 2 KiB; it may include counts, a created-group ID, changed metadata field names, a completion flag, or sent-message ID/priority/routing/wakeup-target count.
+
+#### Failure categories
+
+For failed tool calls, Crosstalk stores a safe category rather than the raw error text:
+
+- **Validation Error**: invalid or incomplete tool input.
+- **Not Found Error**: the requested group or item does not exist.
+- **Authorization Error**: an operation reserved for the group creator was attempted by another context.
+- **Database Busy Error**: SQLite reported a lock or busy condition.
+- **Internal Error**: an unexpected failure that does not fit another category.
 
 Retention cleanup makes deleted pages reusable but does not compact the file. The Storage view’s **Reclaim free space** action performs bounded incremental vacuum work on `observability.sqlite3` only; it does not delete retained audit history or touch any group database. **Delete audit history** is a separate, explicitly confirmed permanent action: it removes audit rows only, leaves group data and audit metadata intact, and does not reclaim free pages automatically.
 
@@ -191,6 +236,8 @@ get_unread_messages(group_id="grp_<id>", context_id="architect-1", name="archite
 `context_id` is the stable, unique identity for an AI or session; `name` is its human-readable role or label. For Codex, use the thread ID exposed in `CODEX_THREAD_ID` as `context_id`, so the identity remains stable when the thread resumes. Do not use a display label such as `architect` as the ID.
 
 Creating a group does **not** join its creator. `join_group` is idempotent and should be called whenever a context connects or reconnects to a server process. Leaving a group removes the membership, unread state, and pending wakeups for that context.
+
+On a context’s first join, every message already in the group is initially unread for that context. Retrieve them with `get_unread_messages` to acknowledge that history and any matching wakeups. Rejoining an existing membership preserves its unread state while updating the display name.
 
 ## Tools
 
