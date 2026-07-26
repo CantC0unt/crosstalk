@@ -27,15 +27,17 @@ OUTPUT_LOCK = threading.Lock()
 WAKEUP_REMINDER_SECONDS = 300
 ACKNOWLEDGED_WAKEUP_RETENTION_DAYS = 7
 SQLITE_LOCK_RETRY_SECONDS = 3
-# Informational layout marker for databases created by this implementation.
-# Crosstalk intentionally does not support automatic migration of older layouts.
-GROUP_SCHEMA_VERSION = 5
+GROUP_SCHEMA_VERSION = 1
 MCP_PROTOCOL_VERSION = "2025-03-26"
 DEFAULT_POLL_INTERVAL_SECONDS = 0.5
 OBSERVABILITY_DATABASE_NAME = "observability.sqlite3"
 # Audit rows preserve the group-name snapshot used at the time of the call.
+# Version 2 adds pre-aggregated analytics tables.  Keep the migration
+# idempotent because audit databases can outlive server upgrades.
 OBSERVABILITY_SCHEMA_VERSION = 2
 RETENTION_CLEANUP_BATCH_SIZE = 1000
+ANALYTICS_RESOLUTIONS = (("1m", 60), ("1h", 3600), ("1d", 86400), ("30d", 30 * 86400))
+ANALYTICS_DIMENSIONS = ("tool_name", "group_id", "context_id", "name", "outcome", "error_category")
 
 
 @dataclass(frozen=True)
@@ -169,6 +171,8 @@ class ObservabilityStore:
 
     def __init__(self, groups_directory: str) -> None:
         self.groups_directory = Path(groups_directory)
+        self._persistent_database: Optional[sqlite3.Connection] = None
+        self._next_retention_cleanup_at: Optional[datetime] = None
 
     @property
     def database_path(self) -> Path:
@@ -185,6 +189,111 @@ class ObservabilityStore:
         connection.execute("PRAGMA busy_timeout=100")
         return connection
 
+    @staticmethod
+    def _bucket_start(occurred_at: str, seconds: int) -> int:
+        timestamp = datetime.fromisoformat(occurred_at.replace("Z", "+00:00"))
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        return int(timestamp.timestamp()) // seconds * seconds
+
+    @staticmethod
+    def _latency_bucket(duration_ms: int) -> str:
+        # Retain exact percentiles through one second, then use compact
+        # logarithmic buckets for the rare, high-latency tail.
+        return "exact:" + str(duration_ms) if duration_ms <= 1000 else "log:" + str(duration_ms.bit_length() - 1)
+
+    @staticmethod
+    def _analytics_values(event: AuditEvent) -> tuple:
+        return (event.tool_name, event.group_id or "", event.context_id or "", event.name or "",
+                event.outcome, event.error_category or "")
+
+    @classmethod
+    def _update_analytics(cls, database: sqlite3.Connection, event: AuditEvent, delta: int = 1) -> None:
+        dimensions = cls._analytics_values(event)
+        placeholders = ", ".join("?" for _ in ANALYTICS_DIMENSIONS)
+        dimension_sql = ", ".join(ANALYTICS_DIMENSIONS)
+        conflict_sql = ", ".join(("bucket_start", *ANALYTICS_DIMENSIONS))
+        for resolution, seconds in ANALYTICS_RESOLUTIONS:
+            bucket_start = cls._bucket_start(event.occurred_at, seconds)
+            database.execute(
+                "INSERT INTO analytics_" + resolution + "(bucket_start, " + dimension_sql + ", call_count, error_count, duration_sum_ms) "
+                "VALUES (?, " + placeholders + ", ?, ?, ?) "
+                "ON CONFLICT(" + conflict_sql + ") DO UPDATE SET "
+                "call_count = call_count + excluded.call_count, error_count = error_count + excluded.error_count, "
+                "duration_sum_ms = duration_sum_ms + excluded.duration_sum_ms",
+                (bucket_start, *dimensions, delta, delta if event.outcome == "error" else 0, delta * event.duration_ms),
+            )
+            database.execute(
+                "INSERT INTO analytics_latency_" + resolution + "(bucket_start, " + dimension_sql + ", latency_bucket, sample_count) "
+                "VALUES (?, " + placeholders + ", ?, ?) "
+                "ON CONFLICT(" + ", ".join(("bucket_start", *ANALYTICS_DIMENSIONS, "latency_bucket")) + ") DO UPDATE SET "
+                "sample_count = sample_count + excluded.sample_count",
+                (bucket_start, *dimensions, cls._latency_bucket(event.duration_ms), delta),
+            )
+
+    @staticmethod
+    def _update_filter_options(database: sqlite3.Connection, event: AuditEvent, delta: int = 1) -> None:
+        values = (("tool_name", event.tool_name, event.tool_name), ("name", event.name, event.name),
+                  ("group_id", event.group_id, event.group_name or event.group_id))
+        for field, value, label in values:
+            if not value:
+                continue
+            if delta > 0:
+                database.execute(
+                    "INSERT INTO analytics_filter_values(field, value, label, count) VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(field, value) DO UPDATE SET count = count + excluded.count, label = excluded.label",
+                    (field, value, label or value, delta),
+                )
+            else:
+                database.execute(
+                    "UPDATE analytics_filter_values SET count = count + ? WHERE field = ? AND value = ?",
+                    (delta, field, value),
+                )
+        if delta < 0:
+            database.execute("DELETE FROM analytics_filter_values WHERE count <= 0")
+
+    @staticmethod
+    def _create_analytics_tables(database: sqlite3.Connection) -> None:
+        dimensions = ",\n                    ".join(field + " TEXT NOT NULL DEFAULT ''" for field in ANALYTICS_DIMENSIONS)
+        key_columns = ", ".join(("bucket_start", *ANALYTICS_DIMENSIONS))
+        for resolution, _ in ANALYTICS_RESOLUTIONS:
+            database.execute(
+                "CREATE TABLE IF NOT EXISTS analytics_" + resolution + " ("
+                "bucket_start INTEGER NOT NULL, " + dimensions + ", "
+                "call_count INTEGER NOT NULL, error_count INTEGER NOT NULL, duration_sum_ms INTEGER NOT NULL, "
+                "PRIMARY KEY (" + key_columns + "))"
+            )
+            database.execute(
+                "CREATE TABLE IF NOT EXISTS analytics_latency_" + resolution + " ("
+                "bucket_start INTEGER NOT NULL, " + dimensions + ", "
+                "latency_bucket TEXT NOT NULL, sample_count INTEGER NOT NULL, "
+                "PRIMARY KEY (" + key_columns + ", latency_bucket))"
+            )
+
+    @staticmethod
+    def _create_filter_options_table(database: sqlite3.Connection) -> None:
+        database.execute(
+            "CREATE TABLE IF NOT EXISTS analytics_filter_values ("
+            "field TEXT NOT NULL, value TEXT NOT NULL, label TEXT NOT NULL, count INTEGER NOT NULL, "
+            "PRIMARY KEY(field, value))"
+        )
+
+    @staticmethod
+    def _backfill_filter_options(database: sqlite3.Connection) -> None:
+        for field in ("tool_name", "name"):
+            database.execute(
+                "INSERT INTO analytics_filter_values(field, value, label, count) "
+                "SELECT ?, {0}, {0}, COUNT(*) FROM tool_calls "
+                "WHERE {0} IS NOT NULL AND {0} != '' GROUP BY {0}".format(field),
+                (field,),
+            )
+        database.execute(
+            "INSERT INTO analytics_filter_values(field, value, label, count) "
+            "SELECT 'group_id', tool_calls.group_id, COALESCE(MAX(tool_call_group_names.group_name), tool_calls.group_id), COUNT(*) "
+            "FROM tool_calls LEFT JOIN tool_call_group_names ON tool_call_group_names.tool_call_id = tool_calls.id "
+            "WHERE tool_calls.group_id IS NOT NULL AND tool_calls.group_id != '' GROUP BY tool_calls.group_id"
+        )
+
     def initialize(self) -> None:
         """Create the initial audit schema without touching group databases."""
         self.groups_directory.mkdir(parents=True, exist_ok=True)
@@ -195,17 +304,28 @@ class ObservabilityStore:
                 # SQLite records this mode in the database header when set before tables.
                 database.execute("PRAGMA auto_vacuum=INCREMENTAL")
             database.execute("PRAGMA journal_mode=WAL")
-            schema_version = database.execute("PRAGMA user_version").fetchone()[0]
-            if schema_version not in (0, 1, OBSERVABILITY_SCHEMA_VERSION):
-                raise ValueError("Unsupported observability schema version: " + str(schema_version))
-            if schema_version == OBSERVABILITY_SCHEMA_VERSION:
-                # Backfill the old nullable audit column once it is encountered.
-                # New events are always assigned a caller label below.
-                database.execute("UPDATE tool_calls SET name = 'MCP client' WHERE name IS NULL OR TRIM(name) = ''")
-                database.commit()
-                return
-            if schema_version == 1:
-                database.execute("CREATE TABLE tool_call_group_names (tool_call_id INTEGER PRIMARY KEY, group_name TEXT NOT NULL)")
+            has_observability_schema = database.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'metadata'"
+            ).fetchone() is not None
+            if has_observability_schema:
+                tables = {row[0] for row in database.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )}
+                needs_analytics_backfill = "analytics_30d" not in tables
+                self._create_analytics_tables(database)
+                self._create_filter_options_table(database)
+                if needs_analytics_backfill:
+                    database.execute(
+                        "CREATE TABLE IF NOT EXISTS tool_call_group_names (tool_call_id INTEGER PRIMARY KEY, group_name TEXT NOT NULL)"
+                    )
+                    columns = {row[1] for row in database.execute("PRAGMA table_info(tool_calls)")}
+                    name_column = "name" if "name" in columns else "NULL"
+                    for row in database.execute(
+                        "SELECT occurred_at, audit_request_id, tool_name, group_id, context_id, " + name_column
+                        + ", outcome, duration_ms, result_count, error_category, details_json FROM tool_calls"
+                    ):
+                        self._update_analytics(database, AuditEvent(*row))
+                    self._backfill_filter_options(database)
                 database.execute("UPDATE metadata SET schema_version = ? WHERE id = 1", (OBSERVABILITY_SCHEMA_VERSION,))
                 database.execute("PRAGMA user_version=" + str(OBSERVABILITY_SCHEMA_VERSION))
                 database.commit()
@@ -238,6 +358,7 @@ class ObservabilityStore:
                 CREATE INDEX tool_calls_by_tool_and_occurred_at ON tool_calls(tool_name, occurred_at);
                 CREATE INDEX tool_calls_by_group_and_occurred_at ON tool_calls(group_id, occurred_at);
                 CREATE INDEX tool_calls_by_context_and_occurred_at ON tool_calls(context_id, occurred_at);
+                CREATE INDEX tool_calls_by_name_and_occurred_at ON tool_calls(name, occurred_at);
                 CREATE INDEX tool_calls_by_outcome_and_occurred_at ON tool_calls(outcome, occurred_at);
                 CREATE TABLE tool_call_group_names (
                     tool_call_id INTEGER PRIMARY KEY,
@@ -245,6 +366,8 @@ class ObservabilityStore:
                 );
                 """
             )
+            self._create_analytics_tables(database)
+            self._create_filter_options_table(database)
             now = self._now()
             database.execute(
                 "INSERT INTO metadata(id, schema_version, created_at, audit_enabled_at, last_retention_cleanup_at, retention_setting) VALUES (1, ?, ?, ?, NULL, NULL)",
@@ -255,9 +378,25 @@ class ObservabilityStore:
         finally:
             database.close()
 
-    def record_event(self, event: AuditEvent, retention_setting: str = "inf") -> None:
+    def start(self) -> None:
+        """Initialize once and retain a process-local connection for synchronous audit writes."""
+        if self._persistent_database is None:
+            self.initialize()
+            self._persistent_database = self._connection(self.database_path)
+
+    def close(self) -> None:
+        if self._persistent_database is not None:
+            self._persistent_database.close()
+            self._persistent_database = None
+
+    def _write_connection(self) -> tuple[sqlite3.Connection, bool]:
+        if self._persistent_database is not None:
+            return self._persistent_database, False
         self.initialize()
-        database = self._connection(self.database_path)
+        return self._connection(self.database_path), True
+
+    def record_event(self, event: AuditEvent, retention_setting: str = "inf") -> None:
+        database, close_after = self._write_connection()
         try:
             database.execute("UPDATE metadata SET retention_setting = ? WHERE id = 1", (retention_setting,))
             cursor = database.execute(
@@ -266,39 +405,61 @@ class ObservabilityStore:
             )
             if event.group_name:
                 database.execute("INSERT INTO tool_call_group_names(tool_call_id, group_name) VALUES (?, ?)", (cursor.lastrowid, event.group_name))
+            self._update_analytics(database, event)
+            self._update_filter_options(database, event)
             database.commit()
         finally:
-            database.close()
+            if close_after:
+                database.close()
 
     def cleanup_retention(self, retention_days: Optional[int]) -> int:
         """Delete one bounded batch of expired rows, at most once per day."""
         if retention_days is None:
             return 0
-        self.initialize()
-        database = self._connection(self.database_path)
+        now = datetime.now(timezone.utc)
+        if self._next_retention_cleanup_at is not None and now < self._next_retention_cleanup_at:
+            return 0
+        database, close_after = self._write_connection()
         try:
-            now = datetime.now(timezone.utc)
             row = database.execute("SELECT last_retention_cleanup_at FROM metadata WHERE id = 1").fetchone()
             if row is not None and row[0]:
                 last_cleanup = datetime.fromisoformat(row[0])
                 if now - last_cleanup < timedelta(days=1):
+                    self._next_retention_cleanup_at = last_cleanup + timedelta(days=1)
                     return 0
             cutoff = (now - timedelta(days=retention_days)).isoformat()
-            expired_ids = [row[0] for row in database.execute(
-                "SELECT id FROM tool_calls WHERE occurred_at < ? ORDER BY occurred_at LIMIT ?",
+            expired_rows = list(database.execute(
+                "SELECT id, occurred_at, audit_request_id, tool_name, group_id, context_id, name, outcome, duration_ms, result_count, error_category, details_json "
+                "FROM tool_calls WHERE occurred_at < ? ORDER BY occurred_at LIMIT ?",
                 (cutoff, RETENTION_CLEANUP_BATCH_SIZE),
-            )]
+            ))
+            expired_ids = [row["id"] for row in expired_rows]
             if expired_ids:
                 placeholders = ",".join("?" for _ in expired_ids)
                 database.execute("DELETE FROM tool_call_group_names WHERE tool_call_id IN (" + placeholders + ")", expired_ids)
                 cursor = database.execute("DELETE FROM tool_calls WHERE id IN (" + placeholders + ")", expired_ids)
+                for row in expired_rows:
+                    self._update_analytics(database, AuditEvent(
+                        occurred_at=row["occurred_at"], audit_request_id=row["audit_request_id"], tool_name=row["tool_name"],
+                        group_id=row["group_id"], context_id=row["context_id"], name=row["name"], outcome=row["outcome"],
+                        duration_ms=row["duration_ms"], result_count=row["result_count"], error_category=row["error_category"],
+                        details_json=row["details_json"],
+                    ), -1)
+                    self._update_filter_options(database, AuditEvent(
+                        occurred_at=row["occurred_at"], audit_request_id=row["audit_request_id"], tool_name=row["tool_name"],
+                        group_id=row["group_id"], context_id=row["context_id"], name=row["name"], outcome=row["outcome"],
+                        duration_ms=row["duration_ms"], result_count=row["result_count"], error_category=row["error_category"],
+                        details_json=row["details_json"],
+                    ), -1)
             else:
                 cursor = None
             database.execute("UPDATE metadata SET last_retention_cleanup_at = ? WHERE id = 1", (now.isoformat(),))
             database.commit()
+            self._next_retention_cleanup_at = now + timedelta(days=1)
             return cursor.rowcount if cursor is not None else 0
         finally:
-            database.close()
+            if close_after:
+                database.close()
 
 
 def audit_tool_result(tool_name: str, arguments: Mapping[str, Any], result: Mapping[str, Any], request_id: Any, started_at: str, started_monotonic: float) -> AuditEvent:
@@ -325,10 +486,11 @@ def audit_tool_result(tool_name: str, arguments: Mapping[str, Any], result: Mapp
     )
 
 
-def attempt_audit_write(store: "CrosstalkStore", event: AuditEvent, retention_days: Optional[int]) -> None:
+def attempt_audit_write(store: "CrosstalkStore", event: AuditEvent, retention_days: Optional[int],
+                        audit_store: Optional[ObservabilityStore] = None) -> None:
     """Make one bounded audit attempt; audit storage never affects a tool call."""
     try:
-        audit_store = ObservabilityStore(str(store.groups_directory))
+        audit_store = audit_store or ObservabilityStore(str(store.groups_directory))
         # A destructive operation can capture its name before removing the group
         # database. Do not replace that historical snapshot with a failed lookup.
         group_name = event.group_name
@@ -375,6 +537,7 @@ class CrosstalkStore:
     def __init__(self, groups_directory: str) -> None:
         self.groups_directory = Path(groups_directory)
         self.groups_directory.mkdir(parents=True, exist_ok=True)
+        self._initialize_catalog()
 
     @staticmethod
     def _validate_group_id(group_id: str) -> str:
@@ -392,17 +555,67 @@ class CrosstalkStore:
     def group_exists(self, group_id: str) -> bool:
         return self._group_path(group_id).is_file()
 
+    @property
+    def _catalog_path(self) -> Path:
+        return self.groups_directory / OBSERVABILITY_DATABASE_NAME
+
+    def _catalog_connection(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(str(self._catalog_path), timeout=0.1)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout=100")
+        return connection
+
+    def _initialize_catalog(self) -> None:
+        connection = self._catalog_connection()
+        try:
+            connection.execute("PRAGMA auto_vacuum=INCREMENTAL")
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS groups ("
+                "group_id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL, "
+                "created_at TEXT, updated_at TEXT NOT NULL)"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def _upsert_catalog(self, metadata: Mapping[str, Any]) -> None:
+        group_id = metadata.get("group_id")
+        if not isinstance(group_id, str):
+            return
+        connection = self._catalog_connection()
+        try:
+            with connection:
+                connection.execute(
+                    "INSERT INTO groups(group_id, name, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(group_id) DO UPDATE SET name = excluded.name, description = excluded.description, "
+                    "created_at = excluded.created_at, updated_at = excluded.updated_at",
+                    (group_id, str(metadata.get("name") or ""), str(metadata.get("description") or ""),
+                     metadata.get("created_at"), str(metadata.get("updated_at") or "")),
+                )
+        finally:
+            connection.close()
+
+    def _remove_catalog_entry(self, group_id: str) -> None:
+        connection = self._catalog_connection()
+        try:
+            with connection:
+                connection.execute("DELETE FROM groups WHERE group_id = ?", (group_id,))
+        finally:
+            connection.close()
+
     @staticmethod
     def _connection(database_path: Path) -> sqlite3.Connection:
         # Keep each attempt short; call_tool performs bounded whole-operation retries.
         connection = sqlite3.connect(str(database_path), timeout=0.1)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout=100")
-        connection.execute("PRAGMA journal_mode=WAL")
         return connection
 
     @staticmethod
     def _initialize_group(db: sqlite3.Connection, creator_context_id: str) -> None:
+        # Journal mode is persistent database configuration, not per-request work.
+        db.execute("PRAGMA journal_mode=WAL")
         db.executescript(
             """
             CREATE TABLE IF NOT EXISTS messages (
@@ -416,6 +629,13 @@ class CrosstalkStore:
                 wakeup_targets TEXT NOT NULL DEFAULT '[]',
                 routing_reason TEXT NOT NULL DEFAULT 'fallback'
             );
+            CREATE INDEX IF NOT EXISTS messages_by_sender_and_id ON messages(sender_context_id, id);
+            CREATE TABLE IF NOT EXISTS group_message_metrics (
+                metric TEXT NOT NULL,
+                value TEXT NOT NULL,
+                count INTEGER NOT NULL,
+                PRIMARY KEY (metric, value)
+            );
             CREATE TABLE IF NOT EXISTS group_metadata (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 name TEXT NOT NULL DEFAULT '',
@@ -428,8 +648,15 @@ class CrosstalkStore:
                 context_id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 joined_at TEXT NOT NULL,
-                unread_message_ids TEXT NOT NULL DEFAULT '[]'
+                latest_message_id INTEGER,
+                unread_count INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS member_unread_messages (
+                context_id TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                PRIMARY KEY (context_id, message_id)
+            );
+            CREATE INDEX IF NOT EXISTS member_unread_messages_by_message ON member_unread_messages(message_id);
             CREATE TABLE IF NOT EXISTS wakeup_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 message_id INTEGER NOT NULL,
@@ -442,6 +669,13 @@ class CrosstalkStore:
                 UNIQUE(message_id, context_id)
             );
             CREATE INDEX IF NOT EXISTS wakeup_events_by_context ON wakeup_events(context_id, id);
+            CREATE TABLE IF NOT EXISTS group_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                message_revision INTEGER NOT NULL DEFAULT 0,
+                member_revision INTEGER NOT NULL DEFAULT 0,
+                wakeup_revision INTEGER NOT NULL DEFAULT 0,
+                metadata_revision INTEGER NOT NULL DEFAULT 0
+            );
             """
         )
         now = datetime.now(timezone.utc).isoformat()
@@ -449,12 +683,95 @@ class CrosstalkStore:
             "INSERT OR IGNORE INTO group_metadata(id, name, description, creator_context_id, created_at, updated_at) VALUES (1, '', '', ?, ?, ?)",
             (creator_context_id, now, now),
         )
+        db.execute("INSERT OR IGNORE INTO group_state(id) VALUES (1)")
+        CrosstalkStore._create_message_search_index(db, rebuild=False)
+        CrosstalkStore._create_message_metrics(db, rebuild=False)
         db.execute("PRAGMA user_version = " + str(GROUP_SCHEMA_VERSION))
         db.commit()
 
     @staticmethod
+    def _create_message_search_index(db: sqlite3.Connection, *, rebuild: bool) -> bool:
+        """Create a LIKE-compatible trigram index when this SQLite build supports FTS5."""
+        try:
+            db.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS message_search "
+                "USING fts5(content, content='messages', content_rowid='id', tokenize='trigram', detail='none')"
+            )
+        except sqlite3.OperationalError as error:
+            if "no such module: fts5" in str(error).lower():
+                return False
+            raise
+        db.executescript(
+            """
+            CREATE TRIGGER IF NOT EXISTS messages_search_after_insert
+            AFTER INSERT ON messages BEGIN
+                INSERT INTO message_search(rowid, content) VALUES (new.id, new.content);
+            END;
+            CREATE TRIGGER IF NOT EXISTS messages_search_after_delete
+            AFTER DELETE ON messages BEGIN
+                INSERT INTO message_search(message_search, rowid, content) VALUES ('delete', old.id, old.content);
+            END;
+            CREATE TRIGGER IF NOT EXISTS messages_search_after_content_update
+            AFTER UPDATE OF content ON messages BEGIN
+                INSERT INTO message_search(message_search, rowid, content) VALUES ('delete', old.id, old.content);
+                INSERT INTO message_search(rowid, content) VALUES (new.id, new.content);
+            END;
+            """
+        )
+        if rebuild:
+            db.execute("INSERT INTO message_search(message_search) VALUES ('rebuild')")
+        return True
+
+    @staticmethod
+    def _rebuild_message_search_index(db: sqlite3.Connection) -> bool:
+        """Replace an older trigram index with the compact LIKE-only layout."""
+        db.executescript(
+            """
+            DROP TRIGGER IF EXISTS messages_search_after_insert;
+            DROP TRIGGER IF EXISTS messages_search_after_delete;
+            DROP TRIGGER IF EXISTS messages_search_after_content_update;
+            DROP TABLE IF EXISTS message_search;
+            """
+        )
+        return CrosstalkStore._create_message_search_index(db, rebuild=True)
+
+    @staticmethod
+    def _create_message_metrics(db: sqlite3.Connection, *, rebuild: bool) -> None:
+        """Maintain compact message breakdowns for Overview without history scans."""
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS group_message_metrics ("
+            "metric TEXT NOT NULL, value TEXT NOT NULL, count INTEGER NOT NULL, "
+            "PRIMARY KEY (metric, value))"
+        )
+        if rebuild:
+            db.execute("DELETE FROM group_message_metrics")
+            for metric, column, default in (("priority", "priority", "normal"), ("routing", "routing_reason", "normal")):
+                db.execute(
+                    "INSERT INTO group_message_metrics(metric, value, count) "
+                    "SELECT ?, COALESCE(" + column + ", ?), COUNT(*) FROM messages GROUP BY COALESCE(" + column + ", ?)",
+                    (metric, default, default),
+                )
+
+    @staticmethod
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat()
+
+    @staticmethod
+    def _record_group_change(db: sqlite3.Connection, *, message: bool = False,
+                             member: bool = False, wakeup: bool = False,
+                             metadata: bool = False) -> None:
+        """Advance only the lightweight observer revisions changed by this transaction."""
+        fields = []
+        if message:
+            fields.append("message_revision = message_revision + 1")
+        if member:
+            fields.append("member_revision = member_revision + 1")
+        if wakeup:
+            fields.append("wakeup_revision = wakeup_revision + 1")
+        if metadata:
+            fields.append("metadata_revision = metadata_revision + 1")
+        if fields:
+            db.execute("UPDATE group_state SET " + ", ".join(fields) + " WHERE id = 1")
 
     def create_group(self, context_id: str, name: str = "", description: str = "") -> str:
         if not isinstance(context_id, str) or not context_id.strip():
@@ -470,21 +787,38 @@ class CrosstalkStore:
             db.commit()
         finally:
             db.close()
+        self._upsert_catalog(self.get_group_metadata(group_id))
         return group_id
 
     def list_groups(self) -> List[Dict[str, str]]:
         """List group databases without opening or exposing their message contents."""
-        groups = []
+        paths = {}
         for path in self.groups_directory.glob("grp_*.sqlite3"):
             group_id = path.name[:-len(".sqlite3")]
             try:
                 self._validate_group_id(group_id)
             except ValueError:
                 continue
-            try:
-                groups.append(self.get_group_metadata(group_id))
-            except (OSError, sqlite3.Error):
-                groups.append({"group_id": group_id, "name": "", "description": ""})
+            paths[group_id] = path
+        connection = self._catalog_connection()
+        try:
+            catalog = {row["group_id"]: dict(row) for row in connection.execute("SELECT group_id, name, description, created_at, updated_at FROM groups")}
+            stale_ids = set(catalog) - set(paths)
+            if stale_ids:
+                with connection:
+                    connection.executemany("DELETE FROM groups WHERE group_id = ?", ((group_id,) for group_id in stale_ids))
+        finally:
+            connection.close()
+        groups = []
+        for group_id in paths:
+            metadata = catalog.get(group_id)
+            if metadata is None:
+                try:
+                    metadata = self.get_group_metadata(group_id)
+                    self._upsert_catalog(metadata)
+                except (OSError, sqlite3.Error):
+                    metadata = {"group_id": group_id, "name": "", "description": ""}
+            groups.append(metadata)
         return sorted(groups, key=lambda group: group["group_id"])
 
     def get_group_metadata(self, group_id: str) -> Dict[str, str]:
@@ -522,9 +856,12 @@ class CrosstalkStore:
                     (name if name is not None else current_name, description if description is not None else current_description,
                      creator_context_id, self._now(), self._now()),
                 )
+                self._record_group_change(db, metadata=True)
         finally:
             db.close()
-        return self.get_group_metadata(group_id)
+        metadata = self.get_group_metadata(group_id)
+        self._upsert_catalog(metadata)
+        return metadata
 
     def group_update_snapshot(self, group_id: str) -> Dict[str, Any]:
         """Read lightweight resource metadata without changing unread state."""
@@ -535,19 +872,32 @@ class CrosstalkStore:
             db.close()
         return {"group_id": group_id, "message_count": row["count"], "latest_message_id": row["latest_id"]}
 
+    def group_message_revision(self, group_id: str) -> int:
+        """Read the constant-size marker used by subscription polling."""
+        db = self._group_connection(group_id)
+        try:
+            row = db.execute("SELECT message_revision FROM group_state WHERE id = 1").fetchone()
+        finally:
+            db.close()
+        if row is None:
+            raise ValueError("Group state marker is missing.")
+        return int(row["message_revision"])
+
     def join_group(self, group_id: str, context_id: str, name: str) -> None:
         self._require_identity(context_id, name)
         db = self._group_connection(group_id)
         try:
             with db:
                 if db.execute("SELECT 1 FROM group_members WHERE context_id = ?", (context_id,)).fetchone() is None:
-                    message_ids = [row["id"] for row in db.execute("SELECT id FROM messages ORDER BY id ASC")]
+                    unread_count = db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
                     db.execute(
-                        "INSERT INTO group_members(context_id, name, joined_at, unread_message_ids) VALUES (?, ?, ?, ?)",
-                        (context_id, name, self._now(), json.dumps(message_ids)),
+                        "INSERT INTO group_members(context_id, name, joined_at, unread_count) VALUES (?, ?, ?, ?)",
+                        (context_id, name, self._now(), unread_count),
                     )
+                    db.execute("INSERT INTO member_unread_messages(context_id, message_id) SELECT ?, id FROM messages", (context_id,))
                 else:
                     db.execute("UPDATE group_members SET name = ? WHERE context_id = ?", (name, context_id))
+                self._record_group_change(db, member=True)
         finally:
             db.close()
 
@@ -558,7 +908,9 @@ class CrosstalkStore:
             with db:
                 self._require_member(db, context_id, name)
                 db.execute("DELETE FROM group_members WHERE context_id = ?", (context_id,))
-                db.execute("DELETE FROM wakeup_events WHERE context_id = ?", (context_id,))
+                db.execute("DELETE FROM member_unread_messages WHERE context_id = ?", (context_id,))
+                wakeups_removed = db.execute("DELETE FROM wakeup_events WHERE context_id = ?", (context_id,)).rowcount
+                self._record_group_change(db, member=True, wakeup=bool(wakeups_removed))
         finally:
             db.close()
 
@@ -570,16 +922,19 @@ class CrosstalkStore:
                 if db.execute("SELECT 1 FROM group_members WHERE context_id = ?", (context_id,)).fetchone() is None:
                     raise AuthorizationError("Context is not a member of this group.")
                 db.execute("DELETE FROM group_members WHERE context_id = ?", (context_id,))
-                db.execute("DELETE FROM wakeup_events WHERE context_id = ?", (context_id,))
+                db.execute("DELETE FROM member_unread_messages WHERE context_id = ?", (context_id,))
+                wakeups_removed = db.execute("DELETE FROM wakeup_events WHERE context_id = ?", (context_id,)).rowcount
+                self._record_group_change(db, member=True, wakeup=bool(wakeups_removed))
         finally:
             db.close()
 
-    def _require_member(self, db: sqlite3.Connection, context_id: str, name: str) -> None:
-        member = db.execute("SELECT name FROM group_members WHERE context_id = ?", (context_id,)).fetchone()
+    def _require_member(self, db: sqlite3.Connection, context_id: str, name: str) -> sqlite3.Row:
+        member = db.execute("SELECT name, latest_message_id FROM group_members WHERE context_id = ?", (context_id,)).fetchone()
         if member is None:
             raise AuthorizationError("Context has not joined this group. Call join_group first.")
         if member["name"] != name:
             raise AuthorizationError("name does not match this context's joined group name. Call join_group to update it.")
+        return member
 
     def wakeup_snapshot(self, group_id: str, context_id: str) -> Dict[str, Any]:
         db = self._group_connection(group_id)
@@ -615,7 +970,9 @@ class CrosstalkStore:
         db = self._group_connection(group_id)
         try:
             with db:
-                db.execute("UPDATE wakeup_events SET last_notified_at = ? WHERE id = ? AND acknowledged_at IS NULL", (self._now(), event_id))
+                changed = db.execute("UPDATE wakeup_events SET last_notified_at = ? WHERE id = ? AND acknowledged_at IS NULL", (self._now(), event_id)).rowcount
+                if changed:
+                    self._record_group_change(db, wakeup=True)
         finally:
             db.close()
 
@@ -627,16 +984,16 @@ class CrosstalkStore:
         return wakeup
 
     def _acknowledge_wakeups_in_transaction(self, db: sqlite3.Connection, context_id: str,
-                                            message_ids: List[int]) -> None:
-        if not message_ids:
-            return
-        placeholders = ",".join("?" for _ in message_ids)
-        db.execute(
-            "UPDATE wakeup_events SET acknowledged_at = ? WHERE context_id = ? AND message_id IN (" + placeholders + ") AND acknowledged_at IS NULL",
-            [self._now(), context_id, *message_ids],
-        )
+                                            message_predicate: str,
+                                            predicate_values: tuple = ()) -> bool:
+        """Acknowledge a selected message set without expanding it into bind parameters."""
+        acknowledged = db.execute(
+            "UPDATE wakeup_events SET acknowledged_at = ? WHERE context_id = ? AND " + message_predicate + " AND acknowledged_at IS NULL",
+            (self._now(), context_id, *predicate_values),
+        ).rowcount
         cutoff = datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() - ACKNOWLEDGED_WAKEUP_RETENTION_DAYS * 86400, timezone.utc).isoformat()
-        db.execute("DELETE FROM wakeup_events WHERE acknowledged_at IS NOT NULL AND acknowledged_at < ?", (cutoff,))
+        expired = db.execute("DELETE FROM wakeup_events WHERE acknowledged_at IS NOT NULL AND acknowledged_at < ?", (cutoff,)).rowcount
+        return bool(acknowledged or expired)
 
     def latest_wakeup_event_id(self, group_id: str, context_id: str) -> int:
         db = self._group_connection(group_id)
@@ -661,14 +1018,12 @@ class CrosstalkStore:
         """List current group members."""
         db = self._group_connection(group_id)
         try:
-            members = db.execute("SELECT context_id, name, joined_at FROM group_members").fetchall()
-            latest_messages = db.execute("SELECT sender_context_id AS context_id, MAX(id) AS latest_message_id FROM messages GROUP BY sender_context_id").fetchall()
+            members = db.execute("SELECT context_id, name, joined_at, latest_message_id FROM group_members").fetchall()
         finally:
             db.close()
-        latest_by_context = {row["context_id"]: row["latest_message_id"] for row in latest_messages}
         users: Dict[str, Dict[str, Any]] = {
             row["context_id"]: {"context_id": row["context_id"], "name": row["name"], "joined_at": row["joined_at"],
-                                "latest_message_id": latest_by_context.get(row["context_id"])}
+                                "latest_message_id": row["latest_message_id"]}
             for row in members
         }
         return sorted(users.values(), key=lambda user: user["context_id"])
@@ -695,12 +1050,14 @@ class CrosstalkStore:
                 target.unlink()
             except FileNotFoundError:
                 pass
+        self._remove_catalog_entry(group_id)
 
     def _group_connection(self, group_id: str) -> sqlite3.Connection:
         path = self._group_path(group_id)
         if not path.is_file():
             raise NotFoundError("Group does not exist: " + group_id + ". Create it first or check the group_id.")
-        return self._connection(path)
+        db = self._connection(path)
+        return db
 
     @staticmethod
     def _json_string_list(value: str) -> List[str]:
@@ -713,7 +1070,14 @@ class CrosstalkStore:
     @staticmethod
     def _has_mention(message_lower: str, identifier: str) -> bool:
         """Match a complete mention token, including punctuation and end-of-message."""
-        return re.search(r"@" + re.escape(identifier.lower()) + r"(?=$|[\s.,!?;:])", message_lower) is not None
+        needle = "@" + identifier.lower()
+        start = message_lower.find(needle)
+        while start >= 0:
+            end = start + len(needle)
+            if end == len(message_lower) or message_lower[end] in " \t\r\n.,!?;:":
+                return True
+            start = message_lower.find(needle, start + 1)
+        return False
 
     def _format_messages(self, rows: List[sqlite3.Row]) -> List[Dict[str, Any]]:
         return [{"id": row["id"], "context_id": row["sender_context_id"],
@@ -723,23 +1087,22 @@ class CrosstalkStore:
                  "routing_reason": row["routing_reason"], "sent_at": row["created_at"]}
                 for row in rows]
 
-    @staticmethod
-    def _unread_ids(value: str) -> List[int]:
-        try:
-            ids = json.loads(value)
-        except (TypeError, json.JSONDecodeError):
-            ids = []
-        return [message_id for message_id in ids if isinstance(message_id, int) and not isinstance(message_id, bool) and message_id > 0]
-
-    def _remove_unread(self, db: sqlite3.Connection, context_id: str, message_ids: List[int]) -> None:
-        if not message_ids:
-            return
-        row = db.execute("SELECT unread_message_ids FROM group_members WHERE context_id = ?", (context_id,)).fetchone()
-        if row is None:
+    def _remove_unread(self, db: sqlite3.Connection, context_id: str,
+                       message_predicate: Optional[str] = None,
+                       predicate_values: tuple = ()) -> int:
+        """Remove unread rows using a set-based predicate, never caller-sized IN lists."""
+        if db.execute("SELECT 1 FROM group_members WHERE context_id = ?", (context_id,)).fetchone() is None:
             raise AuthorizationError("Context has not joined this group. Call join_group first.")
-        removed = set(message_ids)
-        remaining = [message_id for message_id in self._unread_ids(row["unread_message_ids"]) if message_id not in removed]
-        db.execute("UPDATE group_members SET unread_message_ids = ? WHERE context_id = ?", (json.dumps(remaining), context_id))
+        sql = "DELETE FROM member_unread_messages WHERE context_id = ?"
+        if message_predicate is not None:
+            sql += " AND " + message_predicate
+        removed = db.execute(sql, (context_id, *predicate_values)).rowcount
+        if removed:
+            db.execute(
+                "UPDATE group_members SET unread_count = MAX(0, unread_count - ?) WHERE context_id = ?",
+                (removed, context_id),
+            )
+        return removed
 
     def _messages_for_ids(self, db: sqlite3.Connection, message_ids: List[int]) -> List[sqlite3.Row]:
         rows = []
@@ -761,8 +1124,12 @@ class CrosstalkStore:
                     """SELECT id, sender_context_id, sender_name, content, created_at, priority, mentions, wakeup_targets, routing_reason
                        FROM messages WHERE id > ? ORDER BY id ASC""", (after_id,)
                 ).fetchall()
-                self._remove_unread(db, context_id, [row["id"] for row in rows])
-                self._acknowledge_wakeups_in_transaction(db, context_id, [row["id"] for row in rows])
+                if rows:
+                    member_changed = self._remove_unread(db, context_id, "message_id > ?", (after_id,))
+                    wakeup_changed = self._acknowledge_wakeups_in_transaction(db, context_id, "message_id > ?", (after_id,))
+                else:
+                    member_changed = wakeup_changed = False
+                self._record_group_change(db, member=member_changed, wakeup=wakeup_changed)
         finally:
             db.close()
         return self._format_messages(rows)
@@ -777,17 +1144,19 @@ class CrosstalkStore:
         db = self._group_connection(group_id)
         try:
             with db:
-                self._require_member(db, context_id, name)
-                row = db.execute(
-                    "SELECT MAX(id) AS last_id FROM messages WHERE sender_context_id = ?", (context_id,)
-                ).fetchone()
+                member = self._require_member(db, context_id, name)
                 # Before this context's first send, every message in this group is unread.
                 rows = db.execute(
                     """SELECT id, sender_context_id, sender_name, content, created_at, priority, mentions, wakeup_targets, routing_reason
-                       FROM messages WHERE id > ? ORDER BY id ASC""", (int(row["last_id"] or 0),)
+                       FROM messages WHERE id > ? ORDER BY id ASC""", (int(member["latest_message_id"] or 0),)
                 ).fetchall()
-                self._remove_unread(db, context_id, [message["id"] for message in rows])
-                self._acknowledge_wakeups_in_transaction(db, context_id, [message["id"] for message in rows])
+                last_id = int(member["latest_message_id"] or 0)
+                if rows:
+                    member_changed = self._remove_unread(db, context_id, "message_id > ?", (last_id,))
+                    wakeup_changed = self._acknowledge_wakeups_in_transaction(db, context_id, "message_id > ?", (last_id,))
+                else:
+                    member_changed = wakeup_changed = False
+                self._record_group_change(db, member=member_changed, wakeup=wakeup_changed)
         finally:
             db.close()
         return self._format_messages(rows)
@@ -798,12 +1167,21 @@ class CrosstalkStore:
         try:
             with db:
                 self._require_member(db, context_id, name)
-                unread = db.execute("SELECT unread_message_ids FROM group_members WHERE context_id = ?", (context_id,)).fetchone()
-                if unread is None:
-                    raise AuthorizationError("Context has not joined this group. Call join_group first.")
-                unread_rows = self._messages_for_ids(db, self._unread_ids(unread["unread_message_ids"]))
-                self._remove_unread(db, context_id, [row["id"] for row in unread_rows])
-                self._acknowledge_wakeups_in_transaction(db, context_id, [row["id"] for row in unread_rows])
+                unread_rows = db.execute(
+                    "SELECT messages.id, sender_context_id, sender_name, content, created_at, priority, mentions, wakeup_targets, routing_reason "
+                    "FROM member_unread_messages JOIN messages ON messages.id = member_unread_messages.message_id "
+                    "WHERE member_unread_messages.context_id = ? ORDER BY messages.id ASC", (context_id,)
+                ).fetchall()
+                if unread_rows:
+                    wakeup_changed = self._acknowledge_wakeups_in_transaction(
+                        db, context_id,
+                        "message_id IN (SELECT message_id FROM member_unread_messages WHERE context_id = ?)",
+                        (context_id,),
+                    )
+                    member_changed = self._remove_unread(db, context_id)
+                else:
+                    member_changed = wakeup_changed = False
+                self._record_group_change(db, member=member_changed, wakeup=wakeup_changed)
         finally:
             db.close()
         return self._format_messages(unread_rows)
@@ -822,13 +1200,33 @@ class CrosstalkStore:
         try:
             with db:
                 self._require_member(db, context_id, name)
-                rows = db.execute(
-                    """SELECT id, sender_context_id, sender_name, content, created_at, priority, mentions, wakeup_targets, routing_reason
-                       FROM messages WHERE content LIKE ? COLLATE NOCASE ORDER BY id ASC""",
-                    ("%" + query + "%",),
-                ).fetchall()
-                self._remove_unread(db, context_id, [row["id"] for row in rows])
-                self._acknowledge_wakeups_in_transaction(db, context_id, [row["id"] for row in rows])
+                pattern = "%" + query + "%"
+                search_index_exists = db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'message_search'"
+                ).fetchone() is not None
+                if search_index_exists:
+                    rows = db.execute(
+                        """SELECT id, sender_context_id, sender_name, content, created_at, priority, mentions, wakeup_targets, routing_reason
+                           FROM messages WHERE id IN (SELECT rowid FROM message_search WHERE content LIKE ? COLLATE NOCASE)
+                           ORDER BY id ASC""",
+                        (pattern,),
+                    ).fetchall()
+                else:
+                    rows = db.execute(
+                        """SELECT id, sender_context_id, sender_name, content, created_at, priority, mentions, wakeup_targets, routing_reason
+                           FROM messages WHERE content LIKE ? COLLATE NOCASE ORDER BY id ASC""",
+                        (pattern,),
+                    ).fetchall()
+                if rows:
+                    matching_messages = "message_id IN (SELECT id FROM messages WHERE content LIKE ? COLLATE NOCASE)"
+                    matching_value = (pattern,)
+                    member_changed = self._remove_unread(db, context_id, matching_messages, matching_value)
+                    wakeup_changed = self._acknowledge_wakeups_in_transaction(
+                        db, context_id, matching_messages, matching_value,
+                    )
+                else:
+                    member_changed = wakeup_changed = False
+                self._record_group_change(db, member=member_changed, wakeup=wakeup_changed)
         finally:
             db.close()
         return self._format_messages(rows)
@@ -857,23 +1255,26 @@ class CrosstalkStore:
                     """INSERT INTO messages(sender_context_id, sender_name, content, created_at, priority, mentions, wakeup_targets, routing_reason)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", (context_id, name, message, self._now(), priority, "[]", "[]", "fallback")
                 )
-                members_with_unreads = db.execute(
-                    "SELECT context_id, unread_message_ids FROM group_members WHERE context_id != ?", (context_id,)
-                ).fetchall()
-                for member in members_with_unreads:
-                    message_ids = self._unread_ids(member["unread_message_ids"])
-                    if cursor.lastrowid not in message_ids:
-                        db.execute(
-                            "UPDATE group_members SET unread_message_ids = ? WHERE context_id = ?",
-                            (json.dumps(message_ids + [cursor.lastrowid]), member["context_id"]),
-                        )
                 members = db.execute(
                     "SELECT context_id, name FROM group_members WHERE context_id != ?", (context_id,)
                 ).fetchall()
+                # Preserve one unread row per recipient, but let SQLite fan out
+                # the write in one statement instead of a Python-built batch.
+                db.execute(
+                    "INSERT INTO member_unread_messages(context_id, message_id) "
+                    "SELECT context_id, ? FROM group_members WHERE context_id != ?",
+                    (cursor.lastrowid, context_id),
+                )
+                db.execute("UPDATE group_members SET unread_count = unread_count + 1 WHERE context_id != ?", (context_id,))
                 requested_targets = set(wake_context_ids or [])
                 explicit_targets = {row["context_id"] for row in members if row["context_id"] in requested_targets}
                 message_lower = message.lower()
-                mentioned_rows = members if self._has_mention(message_lower, "all") else [row for row in members if self._has_mention(message_lower, row["context_id"]) or self._has_mention(message_lower, row["name"])]
+                if "@" not in message_lower:
+                    mentioned_rows = []
+                elif self._has_mention(message_lower, "all"):
+                    mentioned_rows = members
+                else:
+                    mentioned_rows = [row for row in members if self._has_mention(message_lower, row["context_id"]) or self._has_mention(message_lower, row["name"])]
                 parsed_mentions = [row["context_id"] for row in mentioned_rows]
                 if explicit_targets:
                     targets = [(row["context_id"], "explicit") for row in members if row["context_id"] in explicit_targets]
@@ -889,15 +1290,30 @@ class CrosstalkStore:
                         # No unambiguous target: notify every other joined context.
                         targets = [(row["context_id"], "fallback") for row in members]
                         routing_reason = "fallback"
-                for target_context_id, relevance in targets:
-                    db.execute(
+                if targets:
+                    notified_at = self._now()
+                    db.executemany(
                         """INSERT OR IGNORE INTO wakeup_events(message_id, context_id, relevance, priority, created_at)
                            VALUES (?, ?, ?, ?, ?)""",
-                        (cursor.lastrowid, target_context_id, relevance, priority, self._now()),
+                        [(cursor.lastrowid, target_context_id, relevance, priority, notified_at)
+                         for target_context_id, relevance in targets],
                     )
                 db.execute(
                     "UPDATE messages SET mentions = ?, wakeup_targets = ?, routing_reason = ? WHERE id = ?",
                     (json.dumps(parsed_mentions), json.dumps([target_context_id for target_context_id, _ in targets]), routing_reason, cursor.lastrowid),
+                )
+                db.execute("UPDATE group_members SET latest_message_id = ? WHERE context_id = ?", (cursor.lastrowid, context_id))
+                for metric, value in (("priority", priority), ("routing", routing_reason)):
+                    db.execute(
+                        "INSERT INTO group_message_metrics(metric, value, count) VALUES (?, ?, 1) "
+                        "ON CONFLICT(metric, value) DO UPDATE SET count = count + 1",
+                        (metric, value),
+                    )
+                self._record_group_change(
+                    db,
+                    message=True,
+                    member=bool(members),
+                    wakeup=bool(targets),
                 )
         finally:
             db.close()
@@ -964,8 +1380,8 @@ class GroupSubscriptionMonitor:
             subscription = {"kind": "wakeup", **wakeup}
         else:
             group_id = self.group_id_from_uri(uri)
-            latest_id = self.store.group_update_snapshot(group_id)["latest_message_id"] or 0
-            subscription = {"kind": "group", "latest_id": latest_id, "group_id": group_id}
+            message_revision = self.store.group_message_revision(group_id)
+            subscription = {"kind": "group", "message_revision": message_revision, "group_id": group_id}
         with self._lock:
             self._subscriptions[uri] = subscription
 
@@ -1013,7 +1429,7 @@ class GroupSubscriptionMonitor:
                                 self.store.mark_wakeup_notified(subscription["group_id"], wakeup["id"])
                         continue
                     else:
-                        latest_id = self.store.group_update_snapshot(subscription["group_id"])["latest_message_id"] or 0
+                        message_revision = self.store.group_message_revision(subscription["group_id"])
                 except sqlite3.OperationalError as error:
                     if "locked" in str(error).lower() or "busy" in str(error).lower():
                         # Concurrent writes are expected; retain the subscription and retry.
@@ -1031,12 +1447,12 @@ class GroupSubscriptionMonitor:
                         self._subscriptions.pop(uri, None)
                     self._emit_notification("notifications/resources/updated", {"uri": uri, "relevance": "deleted"})
                     continue
-                if latest_id > subscription["latest_id"]:
+                if message_revision != subscription["message_revision"]:
                     if not self._emit_notification("notifications/resources/updated", {"uri": uri, "priority": "normal", "relevance": "group_change"}):
                         continue
                     with self._lock:
                         if uri in self._subscriptions:
-                            self._subscriptions[uri]["latest_id"] = latest_id
+                            self._subscriptions[uri]["message_revision"] = message_revision
 
 
 IDENTITY_PROPERTIES = {
@@ -1181,7 +1597,7 @@ def notify(method: str, params: Dict[str, Any]) -> None:
 
 
 def _handle_request(request: Any, store: CrosstalkStore, subscriptions: GroupSubscriptionMonitor,
-                    state: Dict[str, bool]) -> Optional[Dict[str, Any]]:
+                    state: Dict[str, bool], audit_store: Optional[ObservabilityStore] = None) -> Optional[Dict[str, Any]]:
     if not isinstance(request, dict) or request.get("jsonrpc") != "2.0":
         return _error_response(None, -32600, "Invalid Request")
     request_id = request.get("id")
@@ -1247,7 +1663,7 @@ def _handle_request(request: Any, store: CrosstalkStore, subscriptions: GroupSub
                 event = audit_tool_result(tool_name, arguments, result, request_id, started_at, started_monotonic)
                 if group_name_before_call is not None:
                     event = replace(event, group_name=group_name_before_call)
-                attempt_audit_write(store, event, audit_configuration.retention_days)
+                attempt_audit_write(store, event, audit_configuration.retention_days, audit_store)
             if invalid_arguments:
                 return _error_response(request_id, -32602, "Invalid params: tools/call arguments must be an object.")
         elif method == "resources/list":
@@ -1298,9 +1714,12 @@ def _handle_request(request: Any, store: CrosstalkStore, subscriptions: GroupSub
 def serve() -> None:
     """Run the existing stdio MCP server."""
     # Validate before opening or creating any group storage.
-    observability_configuration()
+    audit_configuration = observability_configuration()
     default_groups_dir = Path.home() / ".cache" / "crosstalk"
     store = CrosstalkStore(os.environ.get("CROSSTALK_GROUPS_DIR", str(default_groups_dir)))
+    audit_store = ObservabilityStore(str(store.groups_directory)) if audit_configuration.enabled else None
+    if audit_store is not None:
+        audit_store.start()
     try:
         poll_interval = float(os.environ.get("CROSSTALK_POLL_INTERVAL_SECONDS", str(DEFAULT_POLL_INTERVAL_SECONDS)))
         if not math.isfinite(poll_interval) or poll_interval <= 0:
@@ -1323,15 +1742,17 @@ def serve() -> None:
                 if any(isinstance(item, dict) and item.get("method") == "initialize" for item in payload):
                     respond_error(None, -32600, "initialize must not be sent in a batch")
                     continue
-                responses = [response for response in (_handle_request(item, store, subscriptions, state) for item in payload) if response is not None]
+                responses = [response for response in (_handle_request(item, store, subscriptions, state, audit_store) for item in payload) if response is not None]
                 if responses:
                     _write_json(responses)
                 continue
-            response = _handle_request(payload, store, subscriptions, state)
+            response = _handle_request(payload, store, subscriptions, state, audit_store)
             if response is not None:
                 _write_json(response)
     finally:
         subscriptions.stop()
+        if audit_store is not None:
+            audit_store.close()
 
 
 if __name__ == "__main__":
