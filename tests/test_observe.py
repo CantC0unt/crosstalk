@@ -1,4 +1,5 @@
 from contextlib import redirect_stderr, redirect_stdout
+import html
 from io import StringIO
 import sys
 import tempfile
@@ -241,9 +242,11 @@ class ObserverPollingTests(unittest.TestCase):
         self.store.update_group_metadata(self.group_id, "writer", name="Project launch")
         self.store.send_message(self.group_id, "writer", "Writer", "first")
         dashboard = observe.render_dashboard(self.groups_directory)
+        chats = observe.render_chats_workspace(self.groups_directory, self.group_id)
         chat = observe.render_chat_panel(self.groups_directory, self.group_id)
-        self.assertIn(">Project launch</button>", dashboard)
-        self.assertIn('title="{}"'.format(self.group_id), dashboard)
+        self.assertIn('data-view="chats"', dashboard)
+        self.assertIn(">Project launch</button>", chats)
+        self.assertIn('title="{}"'.format(self.group_id), chats)
         displayed_time = chat.split("<time>", 1)[1].split("</time>", 1)[0]
         self.assertRegex(displayed_time, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
         self.assertNotIn("T", displayed_time[:19])
@@ -260,10 +263,15 @@ class ObserverPollingTests(unittest.TestCase):
         self.assertIn("message #1 → reader", rendered)
         self.assertIn("acknowledged pending", rendered)
         self.assertIn("last notified", rendered)
+        self.assertIn('class="unread-badge has-unread">1 unread', rendered)
+        self.assertIn('class="unread-badge is-clear">0 unread', rendered)
 
     def test_dashboard_uses_pinned_sri_assets_and_native_live_client(self):
         dashboard = observe.render_dashboard(self.groups_directory)
         self.assertIn('href="/static/observer.css"', dashboard)
+        self.assertIn('id="theme-toggle"', dashboard)
+        self.assertIn("crosstalk-theme", dashboard)
+        self.assertIn("crosstalk-theme')||'dark'", dashboard)
         self.assertEqual(observe.OBSERVER_STATIC_ASSETS["/static/observer.css"][0], "text/css; charset=utf-8")
         self.assertIn("htmx.org@2.0.4", dashboard)
         self.assertIn("alpinejs@3.14.8", dashboard)
@@ -271,18 +279,40 @@ class ObserverPollingTests(unittest.TestCase):
         self.assertIn("sha384-X9kJyAubVxnP0hcA+AMMs21U445qsnqhnUF8EBlEpP3a42Kh/JwWjlv2ZcvGfphb", dashboard)
         self.assertEqual(dashboard.count('integrity="sha384-'), 2)
         self.assertIn("new EventSource('/events')", dashboard)
+        self.assertIn("item.dataset.view===control.dataset.view", dashboard)
         self.assertIn("source.addEventListener('snapshot'", dashboard)
-        self.assertIn("source.addEventListener('group.deleted'", dashboard)
+        self.assertIn("'group.deleted'", dashboard)
         self.assertIn("htmx:afterSettle", dashboard)
-        self.assertIn("hx-get=\"/fragments/chat?group_id=", dashboard)
+        self.assertIn("hx-get=\"/fragments/chats\"", dashboard)
+        self.assertIn("echarts@6.1.0", dashboard)
+        self.assertIn("sha384-C2iskrW/uPW46KzOjrvJIQo4YkV8lkD+QS0CrDN18IIPIpT/g2USu8bTP3nvmIAD", dashboard)
+        self.assertIn("areaStyle:{color:dark", dashboard)
+        self.assertIn("data-rendered", dashboard)
+        self.assertNotIn("kpi-stack", dashboard)
 
     def test_overview_derives_chat_metrics_and_shows_disabled_audit_notice(self):
         self.store.send_message(self.group_id, "writer", "Writer", "urgent", priority="high")
         overview = observe.render_overview(self.groups_directory)
         self.assertIn("Overview", overview)
+        self.assertIn("Live activity", overview)
+        self.assertIn("Group status", overview)
         self.assertIn("Messages</strong><span>1", overview)
         self.assertIn("high: <strong>1</strong>", overview)
         self.assertIn("Audit analytics are disabled", overview)
+        self.assertIn('class="group-row" role="link" tabindex="0" data-view="chats" hx-get="/fragments/chats?group_id={}"'.format(self.group_id), overview)
+        self.assertIn('data-view="chats" hx-get="/fragments/chats"', overview)
+        self.assertIn('data-view="analytics" hx-get="/fragments/analytics?outcome=error"', overview)
+
+    def test_overview_live_activity_uses_the_500_event_limit(self):
+        snapshot = {"metadata": {"name": "Example"}, "wakeups": []}
+        with patch.object(observe, "discover_groups", return_value=[self.group_id]), \
+             patch.object(observe, "read_group_snapshot", return_value=snapshot), \
+             patch.object(observe, "read_message_page", return_value={"messages": []}) as messages, \
+             patch.object(observe, "read_tool_calls", return_value=[]) as tool_calls:
+            self.assertEqual(observe.overview_events(self.groups_directory), [])
+
+        messages.assert_called_once_with(self.groups_directory, self.group_id, limit=500)
+        tool_calls.assert_called_once_with(self.groups_directory, limit=500)
 
     def test_overview_reports_wakeup_responsiveness_after_acknowledgement(self):
         self.store.join_group(self.group_id, "reader", "Reader")
@@ -299,6 +329,20 @@ class ObserverPollingTests(unittest.TestCase):
         overview = observe.render_overview(self.groups_directory)
         self.assertIn("Tool calls</strong><span>2", overview)
         self.assertIn("Error rate</strong><span>50.0%", overview)
+        self.assertIn("Validation Error", overview)
+        self.assertIn("List Groups", overview)
+        self.assertEqual(observe.format_error_category("sqlite_busy"), "Database Busy Error")
+        self.assertEqual(observe.format_tool_name("send_message"), "Send Message")
+
+    def test_overview_reliability_uses_all_calls_and_keeps_the_latest_100_failures(self):
+        audit_store = mcp.ObservabilityStore(str(self.groups_directory))
+        for index in range(101):
+            audit_store.record_event(mcp.AuditEvent("2026-01-01T12:{:02d}:00+00:00".format(index % 60), str(index), "send_message", self.group_id, "writer", "Writer", "error", index, None, "validation", None))
+
+        reliability = observe.overview_reliability(self.groups_directory)
+
+        self.assertEqual((reliability["calls"], reliability["error_rate"], reliability["latency"]), (101, "100.0%", "95 ms p95"))
+        self.assertEqual(len(reliability["failures"]), 100)
 
     def test_tool_analytics_filters_raw_audit_events_and_calculates_percentiles(self):
         audit_store = mcp.ObservabilityStore(str(self.groups_directory))
@@ -307,12 +351,28 @@ class ObserverPollingTests(unittest.TestCase):
         data = observe.read_tool_analytics(self.groups_directory, {"tool_name": "send_message", "name": "Writer", "from": "2026-01-01T00:00:00+00:00"})
         self.assertEqual(len(data["rows"]), 2)
         self.assertEqual((observe._percentile(data["durations"], .5), observe._percentile(data["durations"], .95)), (12, 40))
-        self.assertEqual(data["by_time"], {"2026-01-01T12:00Z": 1, "2026-01-01T13:00Z": 1})
+        self.assertEqual(data["by_time"], {"2026-01-01T12:00:00Z": 1, "2026-01-01T13:00:00Z": 1})
+        self.assertEqual(data["interval_seconds"], 10)
+        self.assertEqual(data["by_outcome"], {"Success": 1, "Validation Error": 1})
+        validation_only = observe.read_tool_analytics(self.groups_directory, {"outcome": "error:validation"})
+        self.assertEqual(len(validation_only["rows"]), 1)
+        self.assertEqual(validation_only["by_outcome"], {"Validation Error": 1})
+        rendered = observe._analytics_chart(data["by_tool"], "Calls by tool")
+        self.assertIn('class="chart-card"', rendered)
+        self.assertIn("Hover a bar for its exact value.", rendered)
+        self.assertIn("chart-line", observe._analytics_line_chart(data["by_time"], "Calls over time"))
+        self.assertIn("chart-ring", observe._analytics_donut_chart(data["by_outcome"], "Call outcomes"))
         rendered = observe.render_tool_analytics(self.groups_directory, {"from": "2026-01-01T00:00:00+00:00"})
+        self.assertIn('class="echarts-host-native"', rendered)
+        self.assertIn('data-echarts=', rendered)
+        self.assertIn("Success: 50%", html.unescape(rendered))
+        self.assertIn("Validation Error: 50%", html.unescape(rendered))
         self.assertIn("Calls over time", rendered)
         self.assertIn("p95 latency", rendered)
         self.assertIn("<th>Caller</th>", rendered)
         self.assertIn('name="name"', rendered)
+        self.assertIn('value="error:validation">Validation Error', rendered)
+        self.assertIn('value="error:internal">Internal Error', rendered)
 
     def test_storage_view_reports_only_observability_database_state(self):
         audit_store = mcp.ObservabilityStore(str(self.groups_directory))

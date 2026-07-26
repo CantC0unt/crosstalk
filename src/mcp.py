@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from urllib.parse import quote, unquote
 from datetime import datetime, timedelta, timezone
 from importlib.metadata import PackageNotFoundError, version as package_version
@@ -33,9 +33,8 @@ GROUP_SCHEMA_VERSION = 5
 MCP_PROTOCOL_VERSION = "2025-03-26"
 DEFAULT_POLL_INTERVAL_SECONDS = 0.5
 OBSERVABILITY_DATABASE_NAME = "observability.sqlite3"
-# The initial observability schema. Future released schema changes must be
-# designed separately; v1 intentionally has no migration path.
-OBSERVABILITY_SCHEMA_VERSION = 1
+# Audit rows preserve the group-name snapshot used at the time of the call.
+OBSERVABILITY_SCHEMA_VERSION = 2
 RETENTION_CLEANUP_BATCH_SIZE = 1000
 
 
@@ -49,6 +48,32 @@ class ObservabilityConfiguration:
 
 class ObservabilityConfigurationError(ValueError):
     """A configured audit setting is invalid for server startup."""
+
+
+class CrosstalkError(ValueError):
+    """A user-facing domain error with a stable audit category."""
+
+    audit_category = "validation"
+
+
+class ValidationError(CrosstalkError):
+    audit_category = "validation"
+
+
+class NotFoundError(CrosstalkError):
+    audit_category = "not_found"
+
+
+class AuthorizationError(CrosstalkError):
+    audit_category = "authorization"
+
+
+class DatabaseBusyError(CrosstalkError):
+    audit_category = "sqlite_busy"
+
+
+class InternalError(CrosstalkError):
+    audit_category = "internal"
 
 
 AUDIT_DETAILS_MAX_BYTES = 2048
@@ -67,6 +92,7 @@ class AuditEvent:
     result_count: Optional[int]
     error_category: Optional[str]
     details_json: Optional[str]
+    group_name: Optional[str] = None
 
 
 def audit_identity(tool_name: str, arguments: Mapping[str, Any], result: Optional[Mapping[str, Any]] = None) -> Dict[str, Optional[str]]:
@@ -77,7 +103,10 @@ def audit_identity(tool_name: str, arguments: Mapping[str, Any], result: Optiona
         "join_group", "leave_group", "get_all_messages", "get_latest_messages",
         "get_unread_messages", "get_messages_after", "search_messages", "send_message",
     }
-    name = arguments.get("name") if tool_name in caller_name_tools and isinstance(arguments.get("name"), str) else None
+    explicit_caller_name = arguments.get("caller_name")
+    name = explicit_caller_name.strip() if isinstance(explicit_caller_name, str) and explicit_caller_name.strip() else None
+    if name is None and tool_name in caller_name_tools and isinstance(arguments.get("name"), str):
+        name = arguments["name"].strip() or None
     if tool_name == "create_group" and result is not None and isinstance(result.get("group_id"), str):
         group_id = result["group_id"]
     return {"group_id": group_id, "context_id": context_id, "name": name}
@@ -109,14 +138,9 @@ def safe_audit_details(tool_name: str, result: Mapping[str, Any]) -> Optional[st
 
 
 def audit_error_category(error: BaseException) -> str:
-    """Map failures to the fixed analytics-safe category set."""
-    message = str(error).lower()
-    if "locked" in message or "busy" in message:
-        return "sqlite_busy"
-    if "not found" in message or "does not exist" in message:
-        return "not_found"
-    if "only the creator" in message or "not authorized" in message:
-        return "authorization"
+    """Read a stable category from a structured domain error."""
+    if isinstance(error, CrosstalkError):
+        return error.audit_category
     if isinstance(error, (KeyError, TypeError, ValueError)):
         return "validation"
     return "internal"
@@ -172,9 +196,19 @@ class ObservabilityStore:
                 database.execute("PRAGMA auto_vacuum=INCREMENTAL")
             database.execute("PRAGMA journal_mode=WAL")
             schema_version = database.execute("PRAGMA user_version").fetchone()[0]
-            if schema_version not in (0, OBSERVABILITY_SCHEMA_VERSION):
+            if schema_version not in (0, 1, OBSERVABILITY_SCHEMA_VERSION):
                 raise ValueError("Unsupported observability schema version: " + str(schema_version))
             if schema_version == OBSERVABILITY_SCHEMA_VERSION:
+                # Backfill the old nullable audit column once it is encountered.
+                # New events are always assigned a caller label below.
+                database.execute("UPDATE tool_calls SET name = 'MCP client' WHERE name IS NULL OR TRIM(name) = ''")
+                database.commit()
+                return
+            if schema_version == 1:
+                database.execute("CREATE TABLE tool_call_group_names (tool_call_id INTEGER PRIMARY KEY, group_name TEXT NOT NULL)")
+                database.execute("UPDATE metadata SET schema_version = ? WHERE id = 1", (OBSERVABILITY_SCHEMA_VERSION,))
+                database.execute("PRAGMA user_version=" + str(OBSERVABILITY_SCHEMA_VERSION))
+                database.commit()
                 return
             database.executescript(
                 """
@@ -205,6 +239,10 @@ class ObservabilityStore:
                 CREATE INDEX tool_calls_by_group_and_occurred_at ON tool_calls(group_id, occurred_at);
                 CREATE INDEX tool_calls_by_context_and_occurred_at ON tool_calls(context_id, occurred_at);
                 CREATE INDEX tool_calls_by_outcome_and_occurred_at ON tool_calls(outcome, occurred_at);
+                CREATE TABLE tool_call_group_names (
+                    tool_call_id INTEGER PRIMARY KEY,
+                    group_name TEXT NOT NULL
+                );
                 """
             )
             now = self._now()
@@ -222,10 +260,12 @@ class ObservabilityStore:
         database = self._connection(self.database_path)
         try:
             database.execute("UPDATE metadata SET retention_setting = ? WHERE id = 1", (retention_setting,))
-            database.execute(
+            cursor = database.execute(
                 "INSERT INTO tool_calls(occurred_at, audit_request_id, tool_name, group_id, context_id, name, outcome, duration_ms, result_count, error_category, details_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (event.occurred_at, event.audit_request_id, event.tool_name, event.group_id, event.context_id, event.name, event.outcome, event.duration_ms, event.result_count, event.error_category, event.details_json),
             )
+            if event.group_name:
+                database.execute("INSERT INTO tool_call_group_names(tool_call_id, group_name) VALUES (?, ?)", (cursor.lastrowid, event.group_name))
             database.commit()
         finally:
             database.close()
@@ -271,7 +311,7 @@ def audit_tool_result(tool_name: str, arguments: Mapping[str, Any], result: Mapp
         outcome="error" if is_error else "success",
         duration_ms=max(0, round((time.monotonic() - started_monotonic) * 1000)),
         result_count=len(messages) if messages is not None else None,
-        error_category=audit_error_category(ValueError(str(payload.get("error", "")))) if is_error else None,
+        error_category=getattr(result, "audit_error_category", "internal") if is_error else None,
         details_json=None if is_error else safe_audit_details(tool_name, payload),
     )
 
@@ -280,6 +320,28 @@ def attempt_audit_write(store: "CrosstalkStore", event: AuditEvent, retention_da
     """Make one bounded audit attempt; audit storage never affects a tool call."""
     try:
         audit_store = ObservabilityStore(str(store.groups_directory))
+        group_name = None
+        if event.group_id:
+            try:
+                group_name = store.get_group_metadata(event.group_id).get("name") or None
+            except (OSError, sqlite3.Error, ValueError):
+                pass
+        caller_name = event.name
+        if not caller_name and event.group_id and event.context_id:
+            try:
+                caller_name = next(
+                    (member["name"] for member in store.get_users(event.group_id)
+                     if member["context_id"] == event.context_id and member.get("name")),
+                    None,
+                )
+            except (OSError, sqlite3.Error, ValueError):
+                pass
+        # Context-free calls do not carry an actor in the MCP protocol.  Keep a
+        # stable, explicit label instead of allowing an unknown bucket in analytics.
+        caller_name = caller_name or "MCP client"
+        event = replace(event, name=caller_name)
+        if group_name is not None:
+            event = replace(event, group_name=group_name)
         audit_store.record_event(event, "inf" if retention_days is None else str(retention_days))
         audit_store.cleanup_retention(retention_days)
     except (OSError, sqlite3.Error, ValueError):
@@ -439,7 +501,7 @@ class CrosstalkStore:
             with db:
                 current = db.execute("SELECT name, description, creator_context_id FROM group_metadata WHERE id = 1").fetchone()
                 if current is None or current["creator_context_id"] != context_id:
-                    raise ValueError("Only the context that created this group can update its metadata.")
+                    raise AuthorizationError("Only the context that created this group can update its metadata.")
                 current_name = current["name"] if current else ""
                 current_description = current["description"] if current else ""
                 creator_context_id = current["creator_context_id"] if current else ""
@@ -495,7 +557,7 @@ class CrosstalkStore:
         try:
             with db:
                 if db.execute("SELECT 1 FROM group_members WHERE context_id = ?", (context_id,)).fetchone() is None:
-                    raise ValueError("Context is not a member of this group.")
+                    raise AuthorizationError("Context is not a member of this group.")
                 db.execute("DELETE FROM group_members WHERE context_id = ?", (context_id,))
                 db.execute("DELETE FROM wakeup_events WHERE context_id = ?", (context_id,))
         finally:
@@ -504,9 +566,9 @@ class CrosstalkStore:
     def _require_member(self, db: sqlite3.Connection, context_id: str, name: str) -> None:
         member = db.execute("SELECT name FROM group_members WHERE context_id = ?", (context_id,)).fetchone()
         if member is None:
-            raise ValueError("Context has not joined this group. Call join_group first.")
+            raise AuthorizationError("Context has not joined this group. Call join_group first.")
         if member["name"] != name:
-            raise ValueError("name does not match this context's joined group name. Call join_group to update it.")
+            raise AuthorizationError("name does not match this context's joined group name. Call join_group to update it.")
 
     def wakeup_snapshot(self, group_id: str, context_id: str) -> Dict[str, Any]:
         db = self._group_connection(group_id)
@@ -607,14 +669,14 @@ class CrosstalkStore:
             raise ValueError("context_id must be a non-empty string.")
         path = self._group_path(group_id)
         if not path.is_file():
-            raise ValueError("Group does not exist: " + group_id + ". It may already have been deleted.")
+            raise NotFoundError("Group does not exist: " + group_id + ". It may already have been deleted.")
         db = self._connection(path)
         try:
             row = db.execute("SELECT creator_context_id FROM group_metadata WHERE id = 1").fetchone()
         finally:
             db.close()
         if row is None or row["creator_context_id"] != context_id:
-            raise ValueError("Only the context that created this group can delete it.")
+            raise AuthorizationError("Only the context that created this group can delete it.")
         # WAL mode can leave these adjacent temporary files. Their names are derived
         # exclusively from the validated group path above.
         for target in (path, Path(str(path) + "-wal"), Path(str(path) + "-shm")):
@@ -626,7 +688,7 @@ class CrosstalkStore:
     def _group_connection(self, group_id: str) -> sqlite3.Connection:
         path = self._group_path(group_id)
         if not path.is_file():
-            raise ValueError("Group does not exist: " + group_id + ". Create it first or check the group_id.")
+            raise NotFoundError("Group does not exist: " + group_id + ". Create it first or check the group_id.")
         return self._connection(path)
 
     @staticmethod
@@ -663,7 +725,7 @@ class CrosstalkStore:
             return
         row = db.execute("SELECT unread_message_ids FROM group_members WHERE context_id = ?", (context_id,)).fetchone()
         if row is None:
-            raise ValueError("Context has not joined this group. Call join_group first.")
+            raise AuthorizationError("Context has not joined this group. Call join_group first.")
         removed = set(message_ids)
         remaining = [message_id for message_id in self._unread_ids(row["unread_message_ids"]) if message_id not in removed]
         db.execute("UPDATE group_members SET unread_message_ids = ? WHERE context_id = ?", (json.dumps(remaining), context_id))
@@ -727,7 +789,7 @@ class CrosstalkStore:
                 self._require_member(db, context_id, name)
                 unread = db.execute("SELECT unread_message_ids FROM group_members WHERE context_id = ?", (context_id,)).fetchone()
                 if unread is None:
-                    raise ValueError("Context has not joined this group. Call join_group first.")
+                    raise AuthorizationError("Context has not joined this group. Call join_group first.")
                 unread_rows = self._messages_for_ids(db, self._unread_ids(unread["unread_message_ids"]))
                 self._remove_unread(db, context_id, [row["id"] for row in unread_rows])
                 self._acknowledge_wakeups_in_transaction(db, context_id, [row["id"] for row in unread_rows])
@@ -886,7 +948,7 @@ class GroupSubscriptionMonitor:
         if self.WAKEUP_SEGMENT in uri:
             wakeup = self.wakeup_from_uri(uri)
             if not self.is_wakeup_authorized(uri):
-                raise ValueError("Wakeup resource is not authorized for this MCP session. Call join_group first.")
+                raise AuthorizationError("Wakeup resource is not authorized for this MCP session. Call join_group first.")
             self.store.latest_wakeup_event_id(wakeup["group_id"], wakeup["context_id"])
             subscription = {"kind": "wakeup", **wakeup}
         else:
@@ -971,6 +1033,9 @@ IDENTITY_PROPERTIES = {
     "context_id": {"type": "string", "description": "Stable, unique identifier for the calling AI context/session."},
     "name": {"type": "string", "description": "Human-readable caller label or role, used for logging (for example, 'architect')."},
 }
+AUDIT_CALLER_NAME_PROPERTY = {
+    "caller_name": {"type": "string", "description": "Human-readable caller name recorded in audit analytics. Use this for tools that do not otherwise take a caller name."},
+}
 GROUP_METADATA_PROPERTIES = {
     "group_id": {"type": "string", "description": "The target Crosstalk group ID."},
     "name": {"type": "string", "description": "Human-readable group name."},
@@ -994,14 +1059,29 @@ TOOLS = [
     {"name": "send_message", "description": "Send a message to the supplied group as the supplied AI context. Use @context_id, @name, @all, or wake_context_ids for routing; otherwise every other joined context is targeted. Unknown wake_context_ids are ignored; if none are valid, normal routing is used.", "inputSchema": {"type": "object", "properties": {**IDENTITY_PROPERTIES, "message": {"type": "string", "description": "Message body to send."}, "priority": {"type": "string", "enum": ["low", "normal", "high", "urgent"], "default": "normal", "description": "Message priority."}, "wake_context_ids": {"type": "array", "items": {"type": "string"}, "description": "Optional explicit context IDs to wake. Unknown IDs are ignored."}}, "required": ["group_id", "context_id", "name", "message"], "additionalProperties": False}},
 ]
 
+# Every tool may provide an audit-only caller label.  It is removed before the
+# store method is invoked, so this extends observability without changing tool
+# behavior or overloading metadata fields such as a group's `name`.
+for _tool in TOOLS:
+    _tool["inputSchema"]["properties"] = {**_tool["inputSchema"]["properties"], **AUDIT_CALLER_NAME_PROPERTY}
 
-def tool_result(value: Any, is_error: bool = False) -> Dict[str, Any]:
-    return {"content": [{"type": "text", "text": json.dumps(value)}], "isError": is_error}
+
+class ToolResult(dict):
+    """MCP result with private structured failure metadata for audit logging."""
+
+    def __init__(self, value: Any, is_error: bool = False, error_category: Optional[str] = None):
+        super().__init__({"content": [{"type": "text", "text": json.dumps(value)}], "isError": is_error})
+        self.audit_error_category = error_category
+
+
+def tool_result(value: Any, is_error: bool = False, error_category: Optional[str] = None) -> Dict[str, Any]:
+    return ToolResult(value, is_error, error_category)
 
 
 def call_tool(store: CrosstalkStore, tool_name: str, arguments: Dict[str, Any],
               subscriptions: GroupSubscriptionMonitor = None, retry_deadline: float = None,
               retry_delay: float = 0.025) -> Dict[str, Any]:
+    arguments = {key: value for key, value in arguments.items() if key != "caller_name"}
     if retry_deadline is None:
         retry_deadline = time.monotonic() + SQLITE_LOCK_RETRY_SECONDS
     try:
@@ -1044,11 +1124,11 @@ def call_tool(store: CrosstalkStore, tool_name: str, arguments: Dict[str, Any],
             return tool_result({"messages": store.search_messages(**arguments)})
         if tool_name == "send_message":
             return tool_result(store.send_message(**arguments))
-        return tool_result({"error": "Unknown tool: " + tool_name}, True)
+        return tool_result({"error": "Unknown tool: " + tool_name}, True, ValidationError.audit_category)
     except KeyError as error:
-        return tool_result({"error": "Missing required input: " + str(error).strip("'")}, True)
+        return tool_result({"error": "Missing required input: " + str(error).strip("'")}, True, ValidationError.audit_category)
     except (TypeError, ValueError) as error:
-        return tool_result({"error": str(error)}, True)
+        return tool_result({"error": str(error)}, True, audit_error_category(error))
     except sqlite3.OperationalError as error:
         is_lock_error = "locked" in str(error).lower() or "busy" in str(error).lower()
         remaining = retry_deadline - time.monotonic()
@@ -1056,12 +1136,12 @@ def call_tool(store: CrosstalkStore, tool_name: str, arguments: Dict[str, Any],
             time.sleep(min(retry_delay, remaining))
             return call_tool(store, tool_name, arguments, subscriptions, retry_deadline, min(retry_delay * 2, 0.4))
         if is_lock_error:
-            return tool_result({"error": "Cannot complete operation because the group is busy. Please try again in a moment."}, True)
-        return tool_result({"error": "Database error while processing " + tool_name + ": " + str(error)}, True)
+            return tool_result({"error": "Cannot complete operation because the group is busy. Please try again in a moment."}, True, DatabaseBusyError.audit_category)
+        return tool_result({"error": "Database error while processing " + tool_name + ": " + str(error)}, True, InternalError.audit_category)
     except sqlite3.Error as error:
-        return tool_result({"error": "Database error while processing " + tool_name + ": " + str(error)}, True)
+        return tool_result({"error": "Database error while processing " + tool_name + ": " + str(error)}, True, InternalError.audit_category)
     except OSError as error:
-        return tool_result({"error": "Storage error while processing " + tool_name + ": " + str(error)}, True)
+        return tool_result({"error": "Storage error while processing " + tool_name + ": " + str(error)}, True, InternalError.audit_category)
 
 
 def respond(request_id: Any, result: Dict[str, Any]) -> None:
@@ -1149,7 +1229,7 @@ def _handle_request(request: Any, store: CrosstalkStore, subscriptions: GroupSub
             if GroupSubscriptionMonitor.WAKEUP_SEGMENT in uri:
                 wakeup = GroupSubscriptionMonitor.wakeup_from_uri(uri)
                 if not subscriptions.is_wakeup_authorized(uri):
-                    raise ValueError("Wakeup resource is not authorized for this MCP session. Call join_group first.")
+                    raise AuthorizationError("Wakeup resource is not authorized for this MCP session. Call join_group first.")
                 snapshot = store.wakeup_snapshot(wakeup["group_id"], wakeup["context_id"])
             else:
                 group_id = GroupSubscriptionMonitor.group_id_from_uri(uri)
@@ -1169,7 +1249,7 @@ def _handle_request(request: Any, store: CrosstalkStore, subscriptions: GroupSub
             if GroupSubscriptionMonitor.WAKEUP_SEGMENT in uri:
                 wakeup = GroupSubscriptionMonitor.wakeup_from_uri(uri)
                 if not subscriptions.is_wakeup_authorized(uri):
-                    raise ValueError("Wakeup resource is not authorized for this MCP session. Call join_group first.")
+                    raise AuthorizationError("Wakeup resource is not authorized for this MCP session. Call join_group first.")
                 store.leave_group_context(wakeup["group_id"], wakeup["context_id"])
                 subscriptions.revoke_wakeup(uri)
             else:

@@ -95,8 +95,11 @@ class CrosstalkStoreTests(unittest.TestCase):
         self.assertTrue((self.groups_directory / (other_group + ".sqlite3")).exists())
 
     def test_only_creator_can_delete_group(self):
-        with self.assertRaisesRegex(ValueError, "created this group"):
+        with self.assertRaisesRegex(main.AuthorizationError, "created this group"):
             self.store.delete_group(self.group_id, "architect-1")
+        result = main.call_tool(self.store, "delete_group", {"group_id": self.group_id, "context_id": "architect-1"})
+        event = main.audit_tool_result("delete_group", {"group_id": self.group_id, "context_id": "architect-1"}, result, 1, main.datetime.now(main.timezone.utc).isoformat(), main.time.monotonic())
+        self.assertEqual((result["isError"], event.error_category), (True, "authorization"))
         self.assertTrue((self.groups_directory / (self.group_id + ".sqlite3")).exists())
         self.store.delete_group(self.group_id, "developer-1")
         self.assertFalse((self.groups_directory / (self.group_id + ".sqlite3")).exists())
@@ -194,6 +197,12 @@ class CrosstalkStoreTests(unittest.TestCase):
         self.assertEqual(main.audit_identity("update_group_metadata", {"group_id": self.group_id, "context_id": "creator", "name": "New title"}), {"group_id": self.group_id, "context_id": "creator", "name": None})
         self.assertEqual(main.audit_identity("send_message", {"group_id": self.group_id, "context_id": "sender", "name": "developer"}), {"group_id": self.group_id, "context_id": "sender", "name": "developer"})
 
+    def test_audit_identity_prefers_explicit_caller_name(self):
+        self.assertEqual(
+            main.audit_identity("update_group_metadata", {"group_id": self.group_id, "context_id": "creator", "name": "New title", "caller_name": "operator"}),
+            {"group_id": self.group_id, "context_id": "creator", "name": "operator"},
+        )
+
     def test_safe_audit_details_exclude_content_and_are_bounded(self):
         details = main.safe_audit_details("send_message", {"message_id": 7, "priority": "high", "routing_reason": "mentioned", "wakeup_targets": ["a", "b"], "message": "secret"})
         self.assertEqual(json.loads(details), {"message_id": 7, "priority": "high", "routing_reason": "mentioned", "wakeup_target_count": 2})
@@ -201,14 +210,15 @@ class CrosstalkStoreTests(unittest.TestCase):
         self.assertIsNone(main.safe_audit_details("create_group", {"group_id": "x" * 3000}))
 
     def test_audit_error_categories_are_fixed(self):
-        self.assertEqual(main.audit_error_category(main.sqlite3.OperationalError("database is locked")), "sqlite_busy")
-        self.assertEqual(main.audit_error_category(ValueError("group does not exist")), "not_found")
-        self.assertEqual(main.audit_error_category(ValueError("only the creator may delete")), "authorization")
+        self.assertEqual(main.audit_error_category(main.DatabaseBusyError("database is locked")), "sqlite_busy")
+        self.assertEqual(main.audit_error_category(main.NotFoundError("group does not exist")), "not_found")
+        self.assertEqual(main.audit_error_category(main.AuthorizationError("only the creator may delete")), "authorization")
+        self.assertEqual(main.audit_error_category(main.AuthorizationError("Only the context that created this group can delete it.")), "authorization")
         self.assertEqual(main.audit_error_category(ValueError("bad input")), "validation")
         self.assertEqual(main.audit_error_category(RuntimeError("secret error")), "internal")
 
     def test_completed_tool_error_preserves_sqlite_busy_audit_category(self):
-        result = main.tool_result({"error": "database is locked"}, is_error=True)
+        result = main.tool_result({"error": "database is locked"}, is_error=True, error_category="sqlite_busy")
         event = main.audit_tool_result("send_message", {"group_id": self.group_id, "context_id": "developer-1", "name": "developer"}, result, 1, main.datetime.now(main.timezone.utc).isoformat(), main.time.monotonic())
         self.assertEqual((event.outcome, event.error_category), ("error", "sqlite_busy"))
 
@@ -254,6 +264,24 @@ class CrosstalkStoreTests(unittest.TestCase):
             finally:
                 audit.close()
             self.assertEqual(rows, [("2", "list_groups", "success", None), ("3", "unknown", "error", "validation")])
+        finally:
+            monitor.stop()
+
+    def test_auditing_records_an_explicit_caller_name_for_any_tool(self):
+        monitor = main.GroupSubscriptionMonitor(self.store, 0.1)
+        try:
+            state = {"initialized": True, "client_ready": True}
+            with patch.dict("os.environ", {"CROSSTALK_OBSERVABILITY_RETENTION_DAYS": "inf"}, clear=True):
+                response = main._handle_request(
+                    {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "list_groups", "arguments": {"caller_name": "operations"}}},
+                    self.store, monitor, state,
+                )
+            self.assertFalse(response["result"]["isError"])
+            audit = main.sqlite3.connect(str(self.groups_directory / "observability.sqlite3"))
+            try:
+                self.assertEqual(audit.execute("SELECT name FROM tool_calls").fetchone()[0], "operations")
+            finally:
+                audit.close()
         finally:
             monitor.stop()
 
