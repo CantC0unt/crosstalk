@@ -329,8 +329,10 @@ def attempt_audit_write(store: "CrosstalkStore", event: AuditEvent, retention_da
     """Make one bounded audit attempt; audit storage never affects a tool call."""
     try:
         audit_store = ObservabilityStore(str(store.groups_directory))
-        group_name = None
-        if event.group_id:
+        # A destructive operation can capture its name before removing the group
+        # database. Do not replace that historical snapshot with a failed lookup.
+        group_name = event.group_name
+        if group_name is None and event.group_id:
             try:
                 group_name = store.get_group_metadata(event.group_id).get("name") or None
             except (OSError, sqlite3.Error, ValueError):
@@ -1224,6 +1226,14 @@ def _handle_request(request: Any, store: CrosstalkStore, subscriptions: GroupSub
             started_at = datetime.now(timezone.utc).isoformat()
             started_monotonic = time.monotonic()
             invalid_arguments = not isinstance(arguments, dict)
+            group_name_before_call = None
+            if tool_name == "delete_group" and not invalid_arguments:
+                group_id = arguments.get("group_id")
+                if isinstance(group_id, str):
+                    try:
+                        group_name_before_call = store.get_group_metadata(group_id).get("name") or None
+                    except (OSError, sqlite3.Error, ValueError):
+                        pass
             if invalid_arguments:
                 result = tool_result(
                     {"error": "tools/call arguments must be an object."},
@@ -1235,6 +1245,8 @@ def _handle_request(request: Any, store: CrosstalkStore, subscriptions: GroupSub
             audit_configuration = observability_configuration()
             if audit_configuration.enabled:
                 event = audit_tool_result(tool_name, arguments, result, request_id, started_at, started_monotonic)
+                if group_name_before_call is not None:
+                    event = replace(event, group_name=group_name_before_call)
                 attempt_audit_write(store, event, audit_configuration.retention_days)
             if invalid_arguments:
                 return _error_response(request_id, -32602, "Invalid params: tools/call arguments must be an object.")

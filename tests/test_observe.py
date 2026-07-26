@@ -151,6 +151,16 @@ class ObserverPollingTests(unittest.TestCase):
         self.assertIsNone(subscriber.get(timeout=0.2))
         self.assertIsNone(hub.subscribe().get(timeout=0.2))
 
+    def test_event_hub_drops_backpressured_subscribers_and_wakes_handlers(self):
+        hub = observe.EventHub()
+        subscriber = hub.subscribe()
+        for message_id in range(32):
+            hub.publish("message.created", {"message_id": message_id})
+        hub.publish("message.created", {"message_id": 32})
+
+        self.assertNotIn(subscriber, hub.subscribers)
+        self.assertIsNone(subscriber.get(timeout=0.2))
+
     def test_temporary_database_lock_is_skipped_and_detected_after_release(self):
         hub = observe.EventHub()
         poller = observe.ObserverPoller(self.groups_directory, 0.5, hub)
