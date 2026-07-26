@@ -397,12 +397,17 @@ class ObserverPollingTests(unittest.TestCase):
 
     def test_immediate_audit_deletion_is_separate_from_reclaim_and_never_touches_groups(self):
         audit_store = mcp.ObservabilityStore(str(self.groups_directory))
-        audit_store.record_event(mcp.AuditEvent("2026-01-01T12:00:00+00:00", "1", "list_groups", None, None, None, "success", 2, None, None, None))
+        audit_store.record_event(mcp.AuditEvent("2026-01-01T12:00:00+00:00", "1", "send_message", self.group_id, "writer", "Writer", "success", 2, None, None, None, "Project launch"))
         group_path = self.groups_directory / (self.group_id + ".sqlite3")
         group_size = group_path.stat().st_size
         result = observe.delete_audit_history(self.groups_directory)
         self.assertTrue(result["ok"])
         self.assertEqual(observe.read_tool_calls(self.groups_directory), [])
+        audit = mcp.sqlite3.connect(str(self.groups_directory / "observability.sqlite3"))
+        try:
+            self.assertEqual(audit.execute("SELECT COUNT(*) FROM tool_call_group_names").fetchone()[0], 0)
+        finally:
+            audit.close()
         self.assertTrue((self.groups_directory / "observability.sqlite3").is_file())
         self.assertEqual(group_path.stat().st_size, group_size)
         controls = observe.render_storage(self.groups_directory, "csrf-token")

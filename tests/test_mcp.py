@@ -241,12 +241,19 @@ class CrosstalkStoreTests(unittest.TestCase):
         try:
             database.execute("INSERT INTO tool_calls(occurred_at, tool_name, outcome, duration_ms) VALUES (?, 'list_groups', 'success', 1)", ((main.datetime.now(main.timezone.utc) - main.timedelta(days=2)).isoformat(),))
             database.execute("INSERT INTO tool_calls(occurred_at, tool_name, outcome, duration_ms) VALUES (?, 'list_groups', 'success', 1)", (main.datetime.now(main.timezone.utc).isoformat(),))
+            database.execute("INSERT INTO tool_call_group_names(tool_call_id, group_name) VALUES (1, 'Expired group')")
+            database.execute("INSERT INTO tool_call_group_names(tool_call_id, group_name) VALUES (2, 'Current group')")
             database.commit()
         finally:
             database.close()
         self.assertEqual(audit_store.cleanup_retention(None), 0)
         self.assertEqual(audit_store.cleanup_retention(1), 1)
         self.assertEqual(audit_store.cleanup_retention(1), 0)
+        database = main.sqlite3.connect(str(audit_store.database_path))
+        try:
+            self.assertEqual(database.execute("SELECT tool_call_id, group_name FROM tool_call_group_names ORDER BY tool_call_id").fetchall(), [(2, "Current group")])
+        finally:
+            database.close()
 
     def test_enabled_auditing_records_each_completed_tool_call_not_protocol_requests(self):
         monitor = main.GroupSubscriptionMonitor(self.store, 0.1)
@@ -264,6 +271,25 @@ class CrosstalkStoreTests(unittest.TestCase):
             finally:
                 audit.close()
             self.assertEqual(rows, [("2", "list_groups", "success", None), ("3", "unknown", "error", "validation")])
+        finally:
+            monitor.stop()
+
+    def test_invalid_tool_arguments_return_validation_errors_and_are_audited(self):
+        monitor = main.GroupSubscriptionMonitor(self.store, 0.1)
+        try:
+            state = {"initialized": True, "client_ready": True}
+            with patch.dict("os.environ", {"CROSSTALK_OBSERVABILITY_RETENTION_DAYS": "inf"}, clear=True):
+                responses = [main._handle_request(
+                    {"jsonrpc": "2.0", "id": index, "method": "tools/call", "params": {"name": "list_groups", "arguments": arguments}},
+                    self.store, monitor, state,
+                ) for index, arguments in enumerate((None, [], "not-an-object"), start=1)]
+            self.assertEqual([response["error"]["code"] for response in responses], [-32602, -32602, -32602])
+            audit = main.sqlite3.connect(str(self.groups_directory / "observability.sqlite3"))
+            try:
+                rows = audit.execute("SELECT audit_request_id, tool_name, outcome, error_category FROM tool_calls ORDER BY id").fetchall()
+            finally:
+                audit.close()
+            self.assertEqual(rows, [("1", "list_groups", "error", "validation"), ("2", "list_groups", "error", "validation"), ("3", "list_groups", "error", "validation")])
         finally:
             monitor.stop()
 
