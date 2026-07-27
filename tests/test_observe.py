@@ -51,7 +51,7 @@ class ObserveModuleTests(unittest.TestCase):
 
     def test_read_only_database_helper_cannot_mutate_or_create(self):
         with tempfile.TemporaryDirectory() as directory:
-            database_path = Path(directory) / "group.sqlite3"
+            database_path = Path(directory) / ("grp_" + "0" * 32 + ".sqlite3")
             writable = observe.sqlite3.connect(str(database_path))
             try:
                 writable.execute("CREATE TABLE entries(value TEXT)")
@@ -59,7 +59,7 @@ class ObserveModuleTests(unittest.TestCase):
                 writable.commit()
             finally:
                 writable.close()
-            connection = observe.open_read_only_database(database_path)
+            connection = observe.open_read_only_database(database_path, Path(directory))
             try:
                 self.assertEqual(connection.execute("SELECT value FROM entries").fetchone()[0], "kept")
                 with self.assertRaises(observe.sqlite3.OperationalError):
@@ -67,6 +67,13 @@ class ObserveModuleTests(unittest.TestCase):
             finally:
                 connection.close()
             self.assertFalse((Path(directory) / "missing.sqlite3").exists())
+
+    def test_read_only_database_helper_rejects_unapproved_paths(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as outside_directory:
+            groups_directory = Path(directory)
+            outside_path = Path(outside_directory) / "observability.sqlite3"
+            with self.assertRaises(ValueError):
+                observe.open_read_only_database(outside_path, groups_directory)
 
     def test_discovery_tolerates_missing_directories(self):
         self.assertEqual(observe.discover_groups(Path("definitely-missing-crosstalk-groups")), [])
