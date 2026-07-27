@@ -351,7 +351,7 @@ class CrosstalkStoreTests(unittest.TestCase):
     def test_audit_write_failure_does_not_change_a_tool_result(self):
         monitor = main.GroupSubscriptionMonitor(self.store, 0.1)
         try:
-            request = {"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": "list_groups", "arguments": {}}}
+            request = {"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": "list_groups", "arguments": {"caller_name": "operations"}}}
             with patch.dict("os.environ", {"CROSSTALK_OBSERVABILITY_RETENTION_DAYS": "inf"}, clear=True), \
                  patch.object(main.ObservabilityStore, "record_event", side_effect=main.sqlite3.OperationalError("database is locked")) as record_event:
                 response = main._handle_request(request, self.store, monitor, {"initialized": True, "client_ready": True})
@@ -393,8 +393,8 @@ class CrosstalkStoreTests(unittest.TestCase):
             state = {"initialized": True, "client_ready": True}
             with patch.dict("os.environ", {"CROSSTALK_OBSERVABILITY_RETENTION_DAYS": "inf"}, clear=True):
                 self.assertIsNotNone(main._handle_request({"jsonrpc": "2.0", "id": 1, "method": "ping"}, self.store, monitor, state))
-                success = main._handle_request({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "list_groups", "arguments": {}}}, self.store, monitor, state)
-                failure = main._handle_request({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "unknown", "arguments": {}}}, self.store, monitor, state)
+                success = main._handle_request({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "list_groups", "arguments": {"caller_name": "operations"}}}, self.store, monitor, state)
+                failure = main._handle_request({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "unknown", "arguments": {"caller_name": "operations"}}}, self.store, monitor, state)
             self.assertFalse(success["result"]["isError"])
             self.assertTrue(failure["result"]["isError"])
             audit = main.sqlite3.connect(str(self.groups_directory / "observability.sqlite3"))
@@ -443,6 +443,19 @@ class CrosstalkStoreTests(unittest.TestCase):
         finally:
             monitor.stop()
 
+    def test_tool_calls_require_a_non_empty_caller_name(self):
+        monitor = main.GroupSubscriptionMonitor(self.store, 0.1)
+        try:
+            state = {"initialized": True, "client_ready": True}
+            response = main._handle_request(
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "list_groups", "arguments": {}}},
+                self.store, monitor, state,
+            )
+            self.assertEqual(response["error"], {"code": -32602, "message": "Invalid params: tools/call caller_name must be a non-empty string."})
+            self.assertTrue(all("caller_name" in tool["inputSchema"]["required"] for tool in main.TOOLS))
+        finally:
+            monitor.stop()
+
     def test_auditing_preserves_deleted_group_name_snapshot(self):
         self.store.update_group_metadata(self.group_id, "developer-1", name="Release coordination")
         monitor = main.GroupSubscriptionMonitor(self.store, 0.1)
@@ -451,7 +464,7 @@ class CrosstalkStoreTests(unittest.TestCase):
             request = {
                 "jsonrpc": "2.0", "id": 8, "method": "tools/call",
                 "params": {"name": "delete_group", "arguments": {
-                    "group_id": self.group_id, "context_id": "developer-1",
+                    "group_id": self.group_id, "context_id": "developer-1", "caller_name": "developer",
                 }},
             }
             with patch.dict("os.environ", {"CROSSTALK_OBSERVABILITY_RETENTION_DAYS": "inf"}, clear=True):
