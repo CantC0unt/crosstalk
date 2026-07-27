@@ -150,25 +150,25 @@ The observer is read-only for group data. The sidebar provides four views; scree
 
 The operational cockpit combines current group health, a cross-group live-activity stream, and MCP reliability. Live activity shows the 500 newest combined events and distinguishes message content, pending wakeups, successful tool calls, and tool errors. Reliability metrics use all audit rows and list the 100 newest failures. Use **View groups** or **View analytics** to move from a summary to the relevant detail.
 
-![Overview operational cockpit with group health, live activity, and reliability.](https://raw.githubusercontent.com/CantC0unt/crosstalk/main/docs/images/overview.png)
+![Overview operational cockpit with group health, live activity, and reliability.](docs/images/overview.png)
 
 #### Chats
 
 Select a group to browse its chronological conversation. The right-hand panel lists members and their unread counts, plus wakeup creation, acknowledgement, and notification state. Viewing this dashboard does not mark messages as read or acknowledge wakeups.
 
-![Chats view with a group picker, conversation history, members, and wakeups.](https://raw.githubusercontent.com/CantC0unt/crosstalk/main/docs/images/chats.png)
+![Chats view with a group picker, conversation history, members, and wakeups.](docs/images/chats.png)
 
 #### Tool analytics
 
 When audit history is enabled, filter calls by time range, tool, outcome, caller, or group. The view summarizes total calls, latency, and error rate, then shows tool/outcome distributions, activity over time, caller volume, and the matching event log.
 
-![Tool analytics with filters, reliability summaries, charts, and an event log.](https://raw.githubusercontent.com/CantC0unt/crosstalk/main/docs/images/analytics.png)
+![Tool analytics with filters, reliability summaries, charts, and an event log.](docs/images/analytics.png)
 
 #### Storage
 
 The Storage view reports the audit database size, row count, retention setting, activation time, and reclaimable space. **Reclaim free space** performs bounded maintenance without deleting retained audit rows. **Delete audit history** permanently removes audit rows only, after confirmation; it never changes group chat data.
 
-![Storage view with audit-database details and maintenance actions.](https://raw.githubusercontent.com/CantC0unt/crosstalk/main/docs/images/storage.png)
+![Storage view with audit-database details and maintenance actions.](docs/images/storage.png)
 
 ### Overview group health
 
@@ -213,6 +213,8 @@ The dashboard loads pinned HTMX and Alpine.js URLs from their CDNs with Subresou
 ## How it works
 
 Create a group, then have every participating context join before it sends or retrieves messages:
+
+Every MCP `tools/call` request must include a non-empty `caller_name`. It is recorded as the audit caller identity and is separate from a group's metadata `name` or a message sender's `name`.
 
 ```text
 create_group(context_id="developer-1", name="Cache redesign", description="Coordinate the cache work")

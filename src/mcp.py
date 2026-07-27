@@ -312,23 +312,28 @@ class ObservabilityStore:
                     "SELECT name FROM sqlite_master WHERE type = 'table'"
                 )}
                 needs_analytics_backfill = "analytics_30d" not in tables
-                self._create_analytics_tables(database)
-                self._create_filter_options_table(database)
-                if needs_analytics_backfill:
-                    database.execute(
-                        "CREATE TABLE IF NOT EXISTS tool_call_group_names (tool_call_id INTEGER PRIMARY KEY, group_name TEXT NOT NULL)"
-                    )
-                    columns = {row[1] for row in database.execute("PRAGMA table_info(tool_calls)")}
-                    name_column = "name" if "name" in columns else "NULL"
-                    for row in database.execute(
-                        "SELECT occurred_at, audit_request_id, tool_name, group_id, context_id, " + name_column
-                        + ", outcome, duration_ms, result_count, error_category, details_json FROM tool_calls"
-                    ):
-                        self._update_analytics(database, AuditEvent(*row))
-                    self._backfill_filter_options(database)
-                database.execute("UPDATE metadata SET schema_version = ? WHERE id = 1", (OBSERVABILITY_SCHEMA_VERSION,))
-                database.execute("PRAGMA user_version=" + str(OBSERVABILITY_SCHEMA_VERSION))
-                database.commit()
+                database.execute("BEGIN IMMEDIATE")
+                try:
+                    self._create_analytics_tables(database)
+                    self._create_filter_options_table(database)
+                    if needs_analytics_backfill:
+                        database.execute(
+                            "CREATE TABLE IF NOT EXISTS tool_call_group_names (tool_call_id INTEGER PRIMARY KEY, group_name TEXT NOT NULL)"
+                        )
+                        columns = {row[1] for row in database.execute("PRAGMA table_info(tool_calls)")}
+                        name_column = "name" if "name" in columns else "NULL"
+                        for row in database.execute(
+                            "SELECT occurred_at, audit_request_id, tool_name, group_id, context_id, " + name_column
+                            + ", outcome, duration_ms, result_count, error_category, details_json FROM tool_calls"
+                        ):
+                            self._update_analytics(database, AuditEvent(*row))
+                        self._backfill_filter_options(database)
+                    database.execute("UPDATE metadata SET schema_version = ? WHERE id = 1", (OBSERVABILITY_SCHEMA_VERSION,))
+                    database.execute("PRAGMA user_version=" + str(OBSERVABILITY_SCHEMA_VERSION))
+                    database.commit()
+                except BaseException:
+                    database.rollback()
+                    raise
                 return
             database.executescript(
                 """
@@ -408,12 +413,15 @@ class ObservabilityStore:
             self._update_analytics(database, event)
             self._update_filter_options(database, event)
             database.commit()
+        except BaseException:
+            database.rollback()
+            raise
         finally:
             if close_after:
                 database.close()
 
     def cleanup_retention(self, retention_days: Optional[int]) -> int:
-        """Delete one bounded batch of expired rows, at most once per day."""
+        """Drain expired rows in bounded batches, at most once per day."""
         if retention_days is None:
             return 0
         now = datetime.now(timezone.utc)
@@ -424,20 +432,26 @@ class ObservabilityStore:
             row = database.execute("SELECT last_retention_cleanup_at FROM metadata WHERE id = 1").fetchone()
             if row is not None and row[0]:
                 last_cleanup = datetime.fromisoformat(row[0])
+                if last_cleanup.tzinfo is None:
+                    last_cleanup = last_cleanup.replace(tzinfo=timezone.utc)
                 if now - last_cleanup < timedelta(days=1):
                     self._next_retention_cleanup_at = last_cleanup + timedelta(days=1)
                     return 0
             cutoff = (now - timedelta(days=retention_days)).isoformat()
-            expired_rows = list(database.execute(
-                "SELECT id, occurred_at, audit_request_id, tool_name, group_id, context_id, name, outcome, duration_ms, result_count, error_category, details_json "
-                "FROM tool_calls WHERE occurred_at < ? ORDER BY occurred_at LIMIT ?",
-                (cutoff, RETENTION_CLEANUP_BATCH_SIZE),
-            ))
-            expired_ids = [row["id"] for row in expired_rows]
-            if expired_ids:
+            deleted_count = 0
+            while True:
+                expired_rows = list(database.execute(
+                    "SELECT id, occurred_at, audit_request_id, tool_name, group_id, context_id, name, outcome, duration_ms, result_count, error_category, details_json "
+                    "FROM tool_calls WHERE occurred_at < ? ORDER BY occurred_at LIMIT ?",
+                    (cutoff, RETENTION_CLEANUP_BATCH_SIZE),
+                ))
+                expired_ids = [row["id"] for row in expired_rows]
+                if not expired_ids:
+                    break
                 placeholders = ",".join("?" for _ in expired_ids)
                 database.execute("DELETE FROM tool_call_group_names WHERE tool_call_id IN (" + placeholders + ")", expired_ids)
                 cursor = database.execute("DELETE FROM tool_calls WHERE id IN (" + placeholders + ")", expired_ids)
+                deleted_count += cursor.rowcount
                 for row in expired_rows:
                     self._update_analytics(database, AuditEvent(
                         occurred_at=row["occurred_at"], audit_request_id=row["audit_request_id"], tool_name=row["tool_name"],
@@ -451,12 +465,13 @@ class ObservabilityStore:
                         duration_ms=row["duration_ms"], result_count=row["result_count"], error_category=row["error_category"],
                         details_json=row["details_json"],
                     ), -1)
-            else:
-                cursor = None
             database.execute("UPDATE metadata SET last_retention_cleanup_at = ? WHERE id = 1", (now.isoformat(),))
             database.commit()
             self._next_retention_cleanup_at = now + timedelta(days=1)
-            return cursor.rowcount if cursor is not None else 0
+            return deleted_count
+        except BaseException:
+            database.rollback()
+            raise
         finally:
             if close_after:
                 database.close()
@@ -509,15 +524,12 @@ def attempt_audit_write(store: "CrosstalkStore", event: AuditEvent, retention_da
                 )
             except (OSError, sqlite3.Error, ValueError):
                 pass
-        # Context-free calls do not carry an actor in the MCP protocol.  Keep a
-        # stable, explicit label instead of allowing an unknown bucket in analytics.
-        caller_name = caller_name or "MCP client"
         event = replace(event, name=caller_name)
         if group_name is not None:
             event = replace(event, group_name=group_name)
         audit_store.record_event(event, "inf" if retention_days is None else str(retention_days))
         audit_store.cleanup_retention(retention_days)
-    except (OSError, sqlite3.Error, ValueError):
+    except (OSError, sqlite3.Error, ValueError, TypeError, OverflowError):
         pass
 
 
@@ -684,13 +696,13 @@ class CrosstalkStore:
             (creator_context_id, now, now),
         )
         db.execute("INSERT OR IGNORE INTO group_state(id) VALUES (1)")
-        CrosstalkStore._create_message_search_index(db, rebuild=False)
-        CrosstalkStore._create_message_metrics(db, rebuild=False)
+        CrosstalkStore._create_message_search_index(db)
+        CrosstalkStore._create_message_metrics(db)
         db.execute("PRAGMA user_version = " + str(GROUP_SCHEMA_VERSION))
         db.commit()
 
     @staticmethod
-    def _create_message_search_index(db: sqlite3.Connection, *, rebuild: bool) -> bool:
+    def _create_message_search_index(db: sqlite3.Connection) -> bool:
         """Create a LIKE-compatible trigram index when this SQLite build supports FTS5."""
         try:
             db.execute(
@@ -718,39 +730,16 @@ class CrosstalkStore:
             END;
             """
         )
-        if rebuild:
-            db.execute("INSERT INTO message_search(message_search) VALUES ('rebuild')")
         return True
 
     @staticmethod
-    def _rebuild_message_search_index(db: sqlite3.Connection) -> bool:
-        """Replace an older trigram index with the compact LIKE-only layout."""
-        db.executescript(
-            """
-            DROP TRIGGER IF EXISTS messages_search_after_insert;
-            DROP TRIGGER IF EXISTS messages_search_after_delete;
-            DROP TRIGGER IF EXISTS messages_search_after_content_update;
-            DROP TABLE IF EXISTS message_search;
-            """
-        )
-        return CrosstalkStore._create_message_search_index(db, rebuild=True)
-
-    @staticmethod
-    def _create_message_metrics(db: sqlite3.Connection, *, rebuild: bool) -> None:
+    def _create_message_metrics(db: sqlite3.Connection) -> None:
         """Maintain compact message breakdowns for Overview without history scans."""
         db.execute(
             "CREATE TABLE IF NOT EXISTS group_message_metrics ("
             "metric TEXT NOT NULL, value TEXT NOT NULL, count INTEGER NOT NULL, "
             "PRIMARY KEY (metric, value))"
         )
-        if rebuild:
-            db.execute("DELETE FROM group_message_metrics")
-            for metric, column, default in (("priority", "priority", "normal"), ("routing", "routing_reason", "normal")):
-                db.execute(
-                    "INSERT INTO group_message_metrics(metric, value, count) "
-                    "SELECT ?, COALESCE(" + column + ", ?), COUNT(*) FROM messages GROUP BY COALESCE(" + column + ", ?)",
-                    (metric, default, default),
-                )
 
     @staticmethod
     def _now() -> str:
@@ -779,14 +768,23 @@ class CrosstalkStore:
         if not isinstance(name, str) or not isinstance(description, str):
             raise ValueError("name and description must be strings.")
         group_id = "grp_" + uuid.uuid4().hex
-        db = self._connection(self._group_path(group_id))
+        path = self._group_path(group_id)
         try:
-            self._initialize_group(db, context_id)
-            now = self._now()
-            db.execute("UPDATE group_metadata SET name = ?, description = ?, updated_at = ? WHERE id = 1", (name, description, now))
-            db.commit()
-        finally:
-            db.close()
+            db = self._connection(path)
+            try:
+                self._initialize_group(db, context_id)
+                now = self._now()
+                db.execute("UPDATE group_metadata SET name = ?, description = ?, updated_at = ? WHERE id = 1", (name, description, now))
+                db.commit()
+            finally:
+                db.close()
+        except BaseException:
+            for target in (path, Path(str(path) + "-wal"), Path(str(path) + "-shm")):
+                try:
+                    target.unlink()
+                except FileNotFoundError:
+                    pass
+            raise
         self._upsert_catalog(self.get_group_metadata(group_id))
         return group_id
 
@@ -1461,7 +1459,7 @@ IDENTITY_PROPERTIES = {
     "name": {"type": "string", "description": "Human-readable caller label or role, used for logging (for example, 'architect')."},
 }
 AUDIT_CALLER_NAME_PROPERTY = {
-    "caller_name": {"type": "string", "description": "Human-readable caller name recorded in audit analytics. Use this for tools that do not otherwise take a caller name."},
+    "caller_name": {"type": "string", "description": "Required human-readable caller name recorded in audit analytics."},
 }
 GROUP_METADATA_PROPERTIES = {
     "group_id": {"type": "string", "description": "The target Crosstalk group ID."},
@@ -1486,11 +1484,12 @@ TOOLS = [
     {"name": "send_message", "description": "Send a message to the supplied group as the supplied AI context. Use @context_id, @name, @all, or wake_context_ids for routing; otherwise every other joined context is targeted. Unknown wake_context_ids are ignored; if none are valid, normal routing is used.", "inputSchema": {"type": "object", "properties": {**IDENTITY_PROPERTIES, "message": {"type": "string", "description": "Message body to send."}, "priority": {"type": "string", "enum": ["low", "normal", "high", "urgent"], "default": "normal", "description": "Message priority."}, "wake_context_ids": {"type": "array", "items": {"type": "string"}, "description": "Optional explicit context IDs to wake. Unknown IDs are ignored."}}, "required": ["group_id", "context_id", "name", "message"], "additionalProperties": False}},
 ]
 
-# Every tool may provide an audit-only caller label.  It is removed before the
-# store method is invoked, so this extends observability without changing tool
-# behavior or overloading metadata fields such as a group's `name`.
+# Every tool requires an audit-only caller label. It is removed before the
+# store method is invoked, so auditing never overloads metadata fields such as
+# a group's `name`.
 for _tool in TOOLS:
     _tool["inputSchema"]["properties"] = {**_tool["inputSchema"]["properties"], **AUDIT_CALLER_NAME_PROPERTY}
+    _tool["inputSchema"]["required"] = [*_tool["inputSchema"].get("required", []), "caller_name"]
 
 
 class ToolResult(dict):
@@ -1597,7 +1596,9 @@ def notify(method: str, params: Dict[str, Any]) -> None:
 
 
 def _handle_request(request: Any, store: CrosstalkStore, subscriptions: GroupSubscriptionMonitor,
-                    state: Dict[str, bool], audit_store: Optional[ObservabilityStore] = None) -> Optional[Dict[str, Any]]:
+                    state: Dict[str, bool], audit_store: Optional[ObservabilityStore] = None,
+                    audit_configuration: Optional[ObservabilityConfiguration] = None) -> Optional[Dict[str, Any]]:
+    audit_configuration = observability_configuration() if audit_configuration is None else audit_configuration
     if not isinstance(request, dict) or request.get("jsonrpc") != "2.0":
         return _error_response(None, -32600, "Invalid Request")
     request_id = request.get("id")
@@ -1642,6 +1643,7 @@ def _handle_request(request: Any, store: CrosstalkStore, subscriptions: GroupSub
             started_at = datetime.now(timezone.utc).isoformat()
             started_monotonic = time.monotonic()
             invalid_arguments = not isinstance(arguments, dict)
+            missing_caller_name = invalid_arguments or not isinstance(arguments.get("caller_name"), str) or not arguments["caller_name"].strip()
             group_name_before_call = None
             if tool_name == "delete_group" and not invalid_arguments:
                 group_id = arguments.get("group_id")
@@ -1656,16 +1658,23 @@ def _handle_request(request: Any, store: CrosstalkStore, subscriptions: GroupSub
                     True,
                     ValidationError.audit_category,
                 )
+            elif missing_caller_name:
+                result = tool_result(
+                    {"error": "tools/call caller_name must be a non-empty string."},
+                    True,
+                    ValidationError.audit_category,
+                )
             else:
                 result = call_tool(store, tool_name, arguments, subscriptions)
-            audit_configuration = observability_configuration()
-            if audit_configuration.enabled:
+            if audit_configuration is not None and audit_configuration.enabled:
                 event = audit_tool_result(tool_name, arguments, result, request_id, started_at, started_monotonic)
                 if group_name_before_call is not None:
                     event = replace(event, group_name=group_name_before_call)
                 attempt_audit_write(store, event, audit_configuration.retention_days, audit_store)
             if invalid_arguments:
                 return _error_response(request_id, -32602, "Invalid params: tools/call arguments must be an object.")
+            if missing_caller_name:
+                return _error_response(request_id, -32602, "Invalid params: tools/call caller_name must be a non-empty string.")
         elif method == "resources/list":
             result = {"resources": [{"uri": GroupSubscriptionMonitor.uri_for_group(group["group_id"]), "name": "Crosstalk " + group["group_id"], "description": "Group-change signal. A change may not be relevant to this AI; call get_unread_messages to check.", "mimeType": "application/json"} for group in store.list_groups()]}
         elif method == "resources/read":
@@ -1742,11 +1751,11 @@ def serve() -> None:
                 if any(isinstance(item, dict) and item.get("method") == "initialize" for item in payload):
                     respond_error(None, -32600, "initialize must not be sent in a batch")
                     continue
-                responses = [response for response in (_handle_request(item, store, subscriptions, state, audit_store) for item in payload) if response is not None]
+                responses = [response for response in (_handle_request(item, store, subscriptions, state, audit_store, audit_configuration) for item in payload) if response is not None]
                 if responses:
                     _write_json(responses)
                 continue
-            response = _handle_request(payload, store, subscriptions, state, audit_store)
+            response = _handle_request(payload, store, subscriptions, state, audit_store, audit_configuration)
             if response is not None:
                 _write_json(response)
     finally:
