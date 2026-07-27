@@ -312,7 +312,15 @@ OBSERVER_STATIC_ASSETS["/static/observer-live.js"] = (
 
 
 class _ObserverHandler(BaseHTTPRequestHandler):
+    def _allowed_host(self) -> bool:
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
+        return host in {"", "127.0.0.1", "localhost", "::1"}
+
     def do_GET(self) -> None:
+        if not self._allowed_host():
+            self.send_response(403)
+            self.end_headers()
+            return
         request = urlparse(self.path)
         asset = OBSERVER_STATIC_ASSETS.get(request.path)
         if asset is not None:
@@ -917,9 +925,9 @@ def render_chats_workspace(groups_directory: Optional[Path], group_id: Optional[
     group_names = group_catalog_names(groups_directory)
     selected = group_id if group_id in groups else (groups[0] if groups else None)
     picker = "".join(
-        '<button class="{}" hx-get="/fragments/chats?group_id={}" hx-target="#chat-panel" hx-swap="innerHTML">{}</button><!-- title="{}" -->'.format(
-            "is-active" if item == selected else "", html.escape(item),
-            html.escape(group_names.get(item) or group_display_name(groups_directory, item)), html.escape(item),
+        '<button class="{}" title="{}" hx-get="/fragments/chats?group_id={}" hx-target="#chat-panel" hx-swap="innerHTML">{}</button>'.format(
+            "is-active" if item == selected else "", html.escape(item), html.escape(item),
+            html.escape(group_names.get(item) or group_display_name(groups_directory, item)),
         ) for item in groups
     ) or '<p class="notice">No groups found. This page will update when a group database appears.</p>'
     detail = render_chat_panel(groups_directory, selected)
@@ -1216,7 +1224,7 @@ def overview_events(groups_directory: Optional[Path], limit: int = OVERVIEW_EVEN
             if full:
                 next_pending.append((group_id, group_name, source, offset + OVERVIEW_EVENT_PAGE_SIZE, page[-1].get("created_at") or ""))
         ranked = sorted(events, key=lambda item: item.get("created_at") or "", reverse=True)
-        cutoff = ranked[limit - 1].get("created_at") if len(ranked) >= limit else None
+        cutoff = (ranked[limit - 1].get("created_at") or "") if len(ranked) >= limit else None
         pending = [item[:4] for item in next_pending if cutoff is None or item[4] >= cutoff]
     try:
         for call in read_tool_calls(groups_directory, limit=limit):
@@ -1293,7 +1301,7 @@ def analytics_range_start(value: object, unit: object, now: Optional[datetime] =
     except (TypeError, ValueError):
         return None
     unit = ANALYTICS_RANGE_UNIT_MAP.get(str(unit), str(unit))
-    if amount < 1 or unit not in ANALYTICS_RANGE_UNIT_MAP.values():
+    if amount < 1 or amount > 1_000_000 or unit not in ANALYTICS_RANGE_UNIT_MAP.values():
         return None
     current = now or datetime.now(timezone.utc)
     if unit == "seconds":
@@ -1308,6 +1316,8 @@ def analytics_range_start(value: object, unit: object, now: Optional[datetime] =
     month_index = current.year * 12 + current.month - 1 - months
     year, month = divmod(month_index, 12)
     month += 1
+    if year < datetime.min.year:
+        return None
     return current.replace(year=year, month=month, day=min(current.day, calendar.monthrange(year, month)[1]))
 
 
@@ -1320,6 +1330,7 @@ def analytics_filter_options(groups_directory: Optional[Path]) -> dict:
         connection = open_read_only_database(groups_directory / "observability.sqlite3")
         try:
             tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            deleted = 0
             if "analytics_filter_values" in tables:
                 values = [tuple(row) for row in connection.execute(
                     "SELECT field, value, label FROM analytics_filter_values WHERE count > 0 ORDER BY label"
@@ -1614,9 +1625,10 @@ def render_tool_analytics(groups_directory: Optional[Path], filters: Optional[di
     if not data["available"]:
         return '<section class="view analytics" data-analytics="true" data-page-title="Tool analytics" data-page-description="Tool volume, reliability, and latency from audit history.">{}<p class="notice error">Audit data is unavailable. Enable auditing to begin collecting tool analytics.</p></section>'.format(form)
     p50, p95 = _histogram_percentile(data["latency_histogram"], .50), _histogram_percentile(data["latency_histogram"], .95)
-    errors = sum(1 for row in data["rows"] if row["outcome"] == "error")
-    error_rate = "{:.1f}%".format(errors * 100 / len(data["rows"])) if data["rows"] else "0.0%"
-    metrics = '<div class="metrics"><article class="metric"><strong>Total calls</strong><span>{}</span></article><article class="metric"><strong>p50 / p95 latency</strong><span>{} / {} ms</span></article><article class="metric{}"><strong>Error rate</strong><span>{}</span></article></div>'.format(len(data["rows"]), p50 if p50 is not None else "—", p95 if p95 is not None else "—", " is-alert" if errors else "", error_rate)
+    total_calls = sum(data["by_outcome"].values())
+    errors = data["by_outcome"].get("error", 0)
+    error_rate = "{:.1f}%".format(errors * 100 / total_calls) if total_calls else "0.0%"
+    metrics = '<div class="metrics"><article class="metric"><strong>Total calls</strong><span>{}</span></article><article class="metric"><strong>p50 / p95 latency</strong><span>{} / {} ms</span></article><article class="metric{}"><strong>Error rate</strong><span>{}</span></article></div>'.format(total_calls, p50 if p50 is not None else "—", p95 if p95 is not None else "—", " is-alert" if errors else "", error_rate)
     summary = '<div class="analytics-summary-row">{}{}</div>'.format(metrics, _analytics_donut_chart(data["by_tool"], "Calls by tool", show_legend=True) + _analytics_donut_chart(data["by_outcome"], "Call outcomes", show_legend=True))
     row_items = []
     for row in data["rows"]:
@@ -1703,11 +1715,12 @@ def delete_audit_history(groups_directory: Optional[Path]) -> dict:
             # Group-name snapshots are part of each audit event.  They must be
             # removed only when audit history itself is explicitly purged, never
             # when the corresponding group database is deleted.
-            connection.execute("DELETE FROM tool_call_group_names")
-            deleted = connection.execute("DELETE FROM tool_calls").rowcount
-            for resolution, _ in ANALYTICS_ROLLUPS:
-                connection.execute("DELETE FROM analytics_" + resolution)
-                connection.execute("DELETE FROM analytics_latency_" + resolution)
+            tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            for table in ("tool_call_group_names", "tool_calls", *("analytics_" + resolution for resolution, _ in ANALYTICS_ROLLUPS), *("analytics_latency_" + resolution for resolution, _ in ANALYTICS_ROLLUPS)):
+                if table in tables:
+                    cursor = connection.execute("DELETE FROM " + table)
+                    if table == "tool_calls":
+                        deleted = cursor.rowcount
             connection.commit()
         finally:
             connection.close()
@@ -1795,12 +1808,10 @@ def render_dashboard(groups_directory: Optional[Path], csrf_token: Optional[str]
         "source.addEventListener('member.changed',function(e){refreshOverviewGroup(JSON.parse(e.data).group_id)});source.addEventListener('wakeup.changed',function(e){refreshOverviewGroup(JSON.parse(e.data).group_id)})",
     )
     fallback = """<script>(function(){function swap(target,html){var node=document.querySelector(target||'#chat-panel');if(node)node.innerHTML=html}function request(url,options,target){fetch(url,Object.assign({credentials:'same-origin'},options||{})).then(function(response){return response.text()}).then(function(html){swap(target,html)}).catch(function(){swap(target,'<p class="notice error">The local observer request could not be completed. Retry shortly.</p>')})}document.addEventListener('click',function(event){var step=event.target.closest('[data-range-step]');if(step){event.preventDefault();var range=step.closest('.range-composite'),input=range&&range.querySelector('[name=range_unit]'),label=range&&range.querySelector('[data-range-unit]'),units=['s','m','h','d','M','Y'],names={s:'seconds',m:'minutes',h:'hours',d:'days',M:'months',Y:'years'};if(!input||!label)return;var index=units.indexOf(input.value);index=(index<0?2:index)+Number(step.dataset.rangeStep);index=(index+units.length)%units.length;input.value=units[index];label.textContent=names[units[index]];return}var control=event.target.closest('[hx-get],[hx-post]');if(!control||control.tagName==='FORM')return;event.preventDefault();if(control.dataset.view){document.querySelectorAll('[data-view]').forEach(function(item){item.classList.toggle('is-active',item.dataset.view===control.dataset.view)})}if(control.hasAttribute('hx-get')){request(control.getAttribute('hx-get'),null,control.getAttribute('hx-target'));return}if(control.hasAttribute('hx-confirm')&&!window.confirm(control.getAttribute('hx-confirm')))return;var headers={};try{headers=JSON.parse(control.getAttribute('hx-headers')||'{}')}catch(error){}request(control.getAttribute('hx-post'),{method:'POST',headers:headers},control.getAttribute('hx-target'))});document.addEventListener('submit',function(event){var form=event.target.closest('form[hx-get]');if(!form)return;event.preventDefault();var query=new URLSearchParams(new FormData(form));request(form.getAttribute('hx-get')+'?'+query.toString(),null,form.getAttribute('hx-target'))})();</script>"""
-    fallback = fallback.replace("form.getAttribute('hx-target'))})();</script>", "form.getAttribute('hx-target'))});})();</script>")
+    fallback = """<script>(function(){document.addEventListener('click',function(event){var step=event.target.closest('[data-range-step]');if(!step)return;event.preventDefault();var range=step.closest('.range-composite'),input=range&&range.querySelector('[name=range_unit]'),label=range&&range.querySelector('[data-range-unit]'),units=['s','m','h','d','M','Y'],names={s:'seconds',m:'minutes',h:'hours',d:'days',M:'months',Y:'years'};if(!input||!label)return;var index=units.indexOf(input.value);index=(index<0?2:index)+Number(step.dataset.rangeStep);index=(index+units.length)%units.length;input.value=units[index];label.textContent=names[units[index]]})})();</script>"""
     fallback += """<script>(function(){var timer;function analyticsForm(node){var form=node&&node.closest('form[hx-get]');return form&&form.closest('[data-analytics]')?form:null}function apply(form){var query=new URLSearchParams(new FormData(form)),target=document.querySelector(form.getAttribute('hx-target')||'#chat-panel');fetch(form.getAttribute('hx-get')+'?'+query.toString(),{credentials:'same-origin'}).then(function(response){return response.text()}).then(function(html){if(target)target.innerHTML=html})}document.addEventListener('change',function(event){var form=analyticsForm(event.target);if(form)apply(form)});document.addEventListener('input',function(event){if(event.target.name!=='range_value')return;var form=analyticsForm(event.target);if(!form)return;clearTimeout(timer);timer=setTimeout(function(){apply(form)},300)});document.addEventListener('click',function(event){if(!event.target.closest('[data-range-step]'))return;var form=analyticsForm(event.target);if(form)setTimeout(function(){apply(form)},0)})})();</script>"""
     fallback += """<script>(function(){function updatePageContext(){var view=document.querySelector('#chat-panel [data-page-title]'),title=document.getElementById('page-title'),description=document.getElementById('page-description');if(!view||!title||!description)return;title.textContent=view.dataset.pageTitle||'Observer';description.textContent=view.dataset.pageDescription||''}var panel=document.getElementById('chat-panel');if(panel)new MutationObserver(updatePageContext).observe(panel,{childList:true});updatePageContext()})();</script>"""
     fallback += """<script>(function(){var loading;function load(){if(window.echarts)return Promise.resolve(window.echarts);if(loading)return loading;loading=new Promise(function(resolve,reject){var script=document.createElement('script');script.async=true;script.src='https://cdn.jsdelivr.net/npm/echarts@6.1.0/dist/echarts.min.js';script.onload=function(){resolve(window.echarts)};script.onerror=reject;document.head.appendChild(script)});return loading}function colors(name,index){if(name==='Success')return '#466312';if(name==='Error')return '#7d303a';var palette=['#3b9f9b','#587fc0','#8167b5','#ae6c92','#b36a6d','#a47c47','#7d914b','#6d899a','#507a74','#8b769f','#9a7860','#627b68'];return palette[index]||'hsl('+((index*137+187)%360)+' 36% 52%)'}function option(data){var text='#aaa69e',muted='#77746e',grid='#2a2a2a',items=data.data,names=items.map(function(item){return item.name}),values=items.map(function(item){return item.value});if(data.kind==='line')return {animation:false,textStyle:{fontFamily:'Inter,ui-sans-serif,system-ui',color:text},tooltip:{trigger:'axis',backgroundColor:'#1b1b1b',borderColor:'#363636',textStyle:{color:'#e0ded8'}},grid:{left:38,right:18,top:16,bottom:38},xAxis:{type:'category',data:names,boundaryGap:false,axisLine:{lineStyle:{color:grid}},axisTick:{show:false},axisLabel:{color:muted,hideOverlap:true}},yAxis:{type:'value',axisLabel:{color:muted},splitLine:{lineStyle:{color:grid,type:'dashed'}}},series:[{type:'line',data:values,smooth:true,showSymbol:false,lineStyle:{color:'#55c6c1',width:2},areaStyle:{color:'rgba(85,198,193,.14)'},itemStyle:{color:'#55c6c1'}}]};if(data.kind==='bar')return {animation:false,textStyle:{fontFamily:'Inter,ui-sans-serif,system-ui',color:text},tooltip:{trigger:'axis',backgroundColor:'#1b1b1b',borderColor:'#363636',textStyle:{color:'#e0ded8'}},grid:{left:38,right:18,top:16,bottom:48},xAxis:{type:'category',data:names,axisLine:{lineStyle:{color:grid}},axisTick:{show:false},axisLabel:{color:muted,interval:0,hideOverlap:false,fontSize:10}},yAxis:{type:'value',axisLabel:{color:muted},splitLine:{lineStyle:{color:grid,type:'dashed'}}},series:[{type:'bar',data:values,barMaxWidth:42,barCategoryGap:'30%',itemStyle:{color:'#3b9f9b',borderRadius:[4,4,0,0]}}]};var total=values.reduce(function(sum,value){return sum+value},0),center=data.legend?['37%','50%']:['50%','50%'];return {animation:false,color:items.map(function(item,index){return colors(item.name,index)}),textStyle:{fontFamily:'Inter,ui-sans-serif,system-ui',color:text},title:{text:String(total)+'\\ncalls',left:center[0],top:'center',textAlign:'center',textStyle:{color:'#d6d4ce',fontSize:20,fontWeight:700,lineHeight:20}},tooltip:{trigger:'item',backgroundColor:'#1b1b1b',borderColor:'#363636',textStyle:{color:'#e0ded8'},formatter:function(point){return point.name+': '+point.value+' calls ('+point.percent+'%)'}},legend:data.legend?{orient:'vertical',right:12,top:'middle',itemWidth:9,itemHeight:9,itemGap:8,textStyle:{color:text,fontSize:10},formatter:function(name){for(var i=0;i<items.length;i++)if(items[i].name===name)return name+'  '+items[i].value;return name}}:{show:false},series:[{type:'pie',radius:['40%','70%'],center:center,padAngle:2,avoidLabelOverlap:false,label:{show:false},labelLine:{show:false},itemStyle:{borderRadius:5,borderColor:'#151515',borderWidth:3},data:items}]}}function render(host){if(host.dataset.echartsRendered)return;var data;try{data=JSON.parse(host.dataset.echarts)}catch(error){return}load().then(function(echarts){if(host.dataset.echartsRendered)return;host.dataset.echartsRendered='1';var chart=echarts.init(host,null,{renderer:'svg'});chart.setOption(option(data));host._echartsChart=chart;if(window.ResizeObserver)new ResizeObserver(function(){chart.resize()}).observe(host)}).catch(function(){host.textContent='Charts could not be loaded.';host.classList.add('notice','error')})}function renderAll(){document.querySelectorAll('.echarts-host').forEach(render)}function start(){renderAll();var panel=document.getElementById('chat-panel');if(panel)new MutationObserver(renderAll).observe(panel,{childList:true,subtree:true})}if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',start);else start()})();</script>"""
-    page = page.replace(' src="https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js"', ' data-src="https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js"')
-    page = page.replace(' defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.8/dist/cdn.min.js"', ' defer data-src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.8/dist/cdn.min.js"')
     page = page.replace('<div class="brand"><b class="brand-mark">C</b><span>Crosstalk</span></div>', '<button id="sidebar-toggle" class="brand" type="button" aria-label="Collapse sidebar" title="Collapse sidebar"><b class="brand-mark">C</b><span>Crosstalk</span></button>')
     page = page.replace('<button id="sidebar-toggle" type="button"><span>Collapse sidebar</span></button>', '')
     page = page.replace('<div id="activity-indicator" class="sidebar-status">Live</div>', '')
