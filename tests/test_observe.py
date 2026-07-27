@@ -59,7 +59,7 @@ class ObserveModuleTests(unittest.TestCase):
                 writable.commit()
             finally:
                 writable.close()
-            connection = observe.open_read_only_database(database_path, Path(directory))
+            connection = observe.open_read_only_database(Path(directory), database_path.name)
             try:
                 self.assertEqual(connection.execute("SELECT value FROM entries").fetchone()[0], "kept")
                 with self.assertRaises(observe.sqlite3.OperationalError):
@@ -72,8 +72,10 @@ class ObserveModuleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as outside_directory:
             groups_directory = Path(directory)
             outside_path = Path(outside_directory) / "observability.sqlite3"
+            outside_path.touch()
+            (groups_directory / outside_path.name).symlink_to(outside_path)
             with self.assertRaises(ValueError):
-                observe.open_read_only_database(outside_path, groups_directory)
+                observe.open_read_only_database(groups_directory, outside_path.name)
 
     def test_discovery_tolerates_missing_directories(self):
         self.assertEqual(observe.discover_groups(Path("definitely-missing-crosstalk-groups")), [])
