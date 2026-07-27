@@ -91,17 +91,24 @@ def resolve_groups_directory(options: ObserverOptions, environment: Optional[dic
     return Path.home() / ".cache" / "crosstalk"
 
 
-def open_read_only_database(database_path: Path) -> sqlite3.Connection:
-    """Open an existing SQLite database without any ability to mutate it."""
-    uri = database_path.resolve().as_uri() + "?mode=ro"
+GROUP_DATABASE_PATTERN = re.compile(r"grp_[0-9a-f]{32}\.sqlite3$")
+OBSERVABILITY_DATABASE_NAME = "observability.sqlite3"
+
+
+def open_read_only_database(database_path: Path, groups_directory: Path) -> sqlite3.Connection:
+    """Open an approved database below ``groups_directory`` without mutation."""
+    resolved_directory = groups_directory.resolve()
+    resolved_path = database_path.resolve()
+    allowed_name = resolved_path.name == OBSERVABILITY_DATABASE_NAME or GROUP_DATABASE_PATTERN.fullmatch(resolved_path.name)
+    if not allowed_name or resolved_path.parent != resolved_directory:
+        raise ValueError("database path is outside the configured groups directory")
+    uri = resolved_path.as_uri() + "?mode=ro"
     connection = sqlite3.connect(uri, uri=True, timeout=0.1)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA query_only=ON")
     return connection
 
 
-GROUP_DATABASE_PATTERN = re.compile(r"grp_[0-9a-f]{32}\.sqlite3$")
-OBSERVABILITY_DATABASE_NAME = "observability.sqlite3"
 DEFAULT_MESSAGE_PAGE_SIZE = 100
 MAX_MESSAGE_PAGE_SIZE = 500
 OVERVIEW_EVENT_LIMIT = 500
@@ -640,7 +647,7 @@ def group_catalog_names(groups_directory: Optional[Path]) -> dict:
     if not catalog_path.is_file():
         return {}
     try:
-        connection = open_read_only_database(catalog_path)
+        connection = open_read_only_database(catalog_path, groups_directory)
         try:
             rows = connection.execute("SELECT group_id, name FROM groups").fetchall()
         finally:
@@ -667,7 +674,7 @@ def _group_database_path(groups_directory: Path, group_id: Optional[str]) -> Pat
 def read_group_snapshot(groups_directory: Path, group_id: str) -> dict:
     """Read one group database without changing unread or wakeup state."""
     path = _group_database_path(groups_directory, group_id)
-    connection = open_read_only_database(path)
+    connection = open_read_only_database(path, groups_directory)
     try:
         metadata = connection.execute("SELECT name, description, creator_context_id, created_at, updated_at FROM group_metadata WHERE id = 1").fetchone()
         member_columns = {row[1] for row in connection.execute("PRAGMA table_info(group_members)")}
@@ -688,7 +695,7 @@ def read_message_page(groups_directory: Path, group_id: str, older_than_message_
         raise ValueError("message page limit must be between 1 and " + str(MAX_MESSAGE_PAGE_SIZE))
     if older_than_message_id is not None and (not isinstance(older_than_message_id, int) or older_than_message_id < 1):
         raise ValueError("older message cursor must be a positive integer")
-    connection = open_read_only_database(_group_database_path(groups_directory, group_id))
+    connection = open_read_only_database(_group_database_path(groups_directory, group_id), groups_directory)
     try:
         if older_than_message_id is None:
             rows = connection.execute("SELECT id, sender_context_id, sender_name, content, created_at, priority, mentions, wakeup_targets, routing_reason FROM messages ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
@@ -704,7 +711,7 @@ def read_audit_metadata(groups_directory: Path) -> Optional[dict]:
     path = groups_directory / "observability.sqlite3"
     if not path.is_file():
         return None
-    connection = open_read_only_database(path)
+    connection = open_read_only_database(path, groups_directory)
     try:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(metadata)")}
         selected = ["schema_version", "created_at", "audit_enabled_at", "last_retention_cleanup_at"]
@@ -723,7 +730,7 @@ def read_tool_calls(groups_directory: Path, limit: int = 100) -> List[dict]:
     """Read raw recent audit rows; analytics remain derived from raw events."""
     if not 1 <= limit <= MAX_MESSAGE_PAGE_SIZE:
         raise ValueError("tool call limit must be between 1 and " + str(MAX_MESSAGE_PAGE_SIZE))
-    connection = open_read_only_database(groups_directory / "observability.sqlite3")
+    connection = open_read_only_database(groups_directory / OBSERVABILITY_DATABASE_NAME, groups_directory)
     try:
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
         query = "SELECT tool_calls.*, NULL AS group_name FROM tool_calls"
@@ -739,7 +746,7 @@ def read_tool_calls(groups_directory: Path, limit: int = 100) -> List[dict]:
 
 
 def read_tool_duration_values(groups_directory: Path) -> List[int]:
-    connection = open_read_only_database(groups_directory / "observability.sqlite3")
+    connection = open_read_only_database(groups_directory / OBSERVABILITY_DATABASE_NAME, groups_directory)
     try:
         return [row[0] for row in connection.execute("SELECT duration_ms FROM tool_calls ORDER BY occurred_at")]
     finally:
@@ -751,7 +758,7 @@ def latest_audit_id_for_directory(groups_directory: Path) -> Optional[int]:
     path = groups_directory / "observability.sqlite3"
     if not path.is_file():
         return None
-    connection = open_read_only_database(path)
+    connection = open_read_only_database(path, groups_directory)
     try:
         try:
             row = connection.execute("SELECT MAX(id) FROM tool_calls").fetchone()
@@ -764,7 +771,7 @@ def latest_audit_id_for_directory(groups_directory: Path) -> Optional[int]:
 
 def group_fingerprint(groups_directory: Path, group_id: str) -> tuple:
     """Read constant-size observer revisions without loading group state."""
-    connection = open_read_only_database(_group_database_path(groups_directory, group_id))
+    connection = open_read_only_database(_group_database_path(groups_directory, group_id), groups_directory)
     try:
         row = connection.execute(
             "SELECT message_revision, member_revision, wakeup_revision, metadata_revision "
@@ -779,7 +786,7 @@ def group_fingerprint(groups_directory: Path, group_id: str) -> tuple:
 
 def latest_message_id_for_group(groups_directory: Path, group_id: str) -> Optional[int]:
     """Read the scalar message cursor only after a message revision changes."""
-    connection = open_read_only_database(_group_database_path(groups_directory, group_id))
+    connection = open_read_only_database(_group_database_path(groups_directory, group_id), groups_directory)
     try:
         row = connection.execute("SELECT MAX(id) FROM messages").fetchone()
         return row[0] if row is not None else None
@@ -871,7 +878,7 @@ def render_visible_message(groups_directory: Optional[Path], group_id: Optional[
     if groups_directory is None or not _valid_group_id(group_id) or message_id < 1:
         return '<p class="notice error">Message is unavailable.</p>'
     try:
-        connection = open_read_only_database(_group_database_path(groups_directory, group_id))
+        connection = open_read_only_database(_group_database_path(groups_directory, group_id), groups_directory)
         try:
             row = connection.execute(
                 "SELECT id, sender_context_id, sender_name, content, created_at, priority, routing_reason FROM messages WHERE id = ?",
@@ -941,7 +948,7 @@ def collect_overview_groups(groups_directory: Optional[Path], message_limit: int
     groups = []
     for group_id in discover_groups(groups_directory):
         try:
-            connection = open_read_only_database(_group_database_path(groups_directory, group_id))
+            connection = open_read_only_database(_group_database_path(groups_directory, group_id), groups_directory)
             try:
                 metadata = connection.execute("SELECT name, description, creator_context_id, created_at, updated_at FROM group_metadata WHERE id = 1").fetchone()
                 member_columns = {row[1] for row in connection.execute("PRAGMA table_info(group_members)")}
@@ -1128,7 +1135,7 @@ def overview_group_row(groups_directory: Optional[Path], group_id: Optional[str]
     if groups_directory is None or not _valid_group_id(group_id):
         return None
     try:
-        connection = open_read_only_database(_group_database_path(groups_directory, group_id))
+        connection = open_read_only_database(_group_database_path(groups_directory, group_id), groups_directory)
         try:
             metadata = connection.execute("SELECT name FROM group_metadata WHERE id = 1").fetchone()
             columns = {row[1] for row in connection.execute("PRAGMA table_info(group_members)")}
@@ -1193,7 +1200,7 @@ def overview_events(groups_directory: Optional[Path], limit: int = OVERVIEW_EVEN
         except (OSError, sqlite3.Error, ValueError):
             continue
     def load_page(group_id: str, group_name: str, source: str, offset: int) -> tuple:
-        connection = open_read_only_database(_group_database_path(groups_directory, group_id))
+        connection = open_read_only_database(_group_database_path(groups_directory, group_id), groups_directory)
         try:
             if source == "messages":
                 rows = [dict(row) for row in connection.execute(
@@ -1243,7 +1250,7 @@ def overview_reliability(groups_directory: Optional[Path]) -> dict:
     if groups_directory is None or not (groups_directory / "observability.sqlite3").is_file():
         return {"available": False, "calls": 0, "error_rate": "—", "latency": "—", "failures": []}
     try:
-        connection = open_read_only_database(groups_directory / "observability.sqlite3")
+        connection = open_read_only_database(groups_directory / OBSERVABILITY_DATABASE_NAME, groups_directory)
         try:
             failures = [dict(row) for row in connection.execute(
                 "SELECT occurred_at, tool_name, duration_ms, error_category FROM tool_calls WHERE outcome = 'error' ORDER BY occurred_at DESC, id DESC LIMIT 100"
@@ -1327,7 +1334,7 @@ def analytics_filter_options(groups_directory: Optional[Path]) -> dict:
     if groups_directory is None or not (groups_directory / "observability.sqlite3").is_file():
         return options
     try:
-        connection = open_read_only_database(groups_directory / "observability.sqlite3")
+        connection = open_read_only_database(groups_directory / OBSERVABILITY_DATABASE_NAME, groups_directory)
         try:
             tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
             deleted = 0
@@ -1448,7 +1455,7 @@ def _histogram_percentile(rows: List[tuple], percentile: float) -> Optional[int]
 
 def read_audit_rollup_summary(groups_directory: Path) -> dict:
     """Read full-history reliability metrics from the coarsest rollup tier."""
-    connection = open_read_only_database(groups_directory / "observability.sqlite3")
+    connection = open_read_only_database(groups_directory / OBSERVABILITY_DATABASE_NAME, groups_directory)
     try:
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
         if {"analytics_30d", "analytics_latency_30d"}.issubset(tables):
@@ -1503,7 +1510,7 @@ def read_tool_analytics(groups_directory: Optional[Path], filters: Optional[dict
     if raw_clauses: raw_query += " WHERE " + " AND ".join(raw_clauses)
     raw_query += " ORDER BY occurred_at DESC LIMIT 500"
     try:
-        connection = open_read_only_database(groups_directory / "observability.sqlite3")
+        connection = open_read_only_database(groups_directory / OBSERVABILITY_DATABASE_NAME, groups_directory)
         try:
             tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
             if "tool_call_group_names" in tables: raw_query = raw_query.replace("NULL AS group_name", "tool_call_group_names.group_name").replace("FROM tool_calls", "FROM tool_calls LEFT JOIN tool_call_group_names ON tool_call_group_names.tool_call_id = tool_calls.id")
@@ -1655,7 +1662,7 @@ def audit_storage_status(groups_directory: Optional[Path], environment: Optional
     if not path.is_file():
         return status
     try:
-        connection = open_read_only_database(path)
+        connection = open_read_only_database(path, groups_directory)
         try:
             status["row_count"] = connection.execute("SELECT COUNT(*) FROM tool_calls").fetchone()[0]
             page_size = connection.execute("PRAGMA page_size").fetchone()[0]
